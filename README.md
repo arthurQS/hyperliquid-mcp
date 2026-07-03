@@ -9,6 +9,10 @@ A Model Context Protocol (MCP) server for Hyperliquid perpetual trading using th
 ✅ **Secure** - Proper EIP-712 signing with agent mode support  
 ✅ **Bracket Orders** - Atomic entry + TP + SL order placement  
 ✅ **Market Data** - Real-time prices, order books, funding rates, candles  
+✅ **Live WebSocket State Engine** - In-memory order book mirror for instant, low-latency reads  
+✅ **Microstructure Signals** - Server-computed OBI, micro-price, and spread (bps) in a ~20-token payload  
+✅ **Trade-Flow Signals** - Server-computed CVD, aggressor volume, and trade-flow imbalance from the live trade tape  
+✅ **Monte Carlo Risk** - Vectorized GBM simulation (10k+ paths) returning VaR, terminal distribution, and probability of profit  
 ✅ **Account Management** - Positions, balances, fills, funding history  
 ✅ **Testnet Support** - Test strategies safely before going live
 
@@ -184,10 +188,16 @@ Configure according to your client's documentation, using:
 
 - **`hyperliquid_get_meta`** - Get exchange metadata (assets, leverage, etc.)
 - **`hyperliquid_get_all_mids`** - Get current mid prices for all assets
-- **`hyperliquid_get_order_book`** - Get order book depth
+- **`hyperliquid_get_order_book`** - Get order book depth (top `depth` levels per side, default 5; served from a live WebSocket mirror)
+- **`hyperliquid_get_microstructure`** - Get dense edge-level signals (OBI, micro-price, spread in bps) computed server-side
+- **`hyperliquid_get_orderflow`** - Get dense trade-flow signals (CVD, aggressor buy/sell volume, trade-flow imbalance) over a recent window, computed server-side
 - **`hyperliquid_get_recent_trades`** - Get recent trades
 - **`hyperliquid_get_historical_funding`** - Get funding rate history
 - **`hyperliquid_get_candles`** - Get OHLCV candle data
+
+### Risk & Quant
+
+- **`hyperliquid_run_monte_carlo`** - Run a vectorized GBM Monte Carlo price simulation and return an aggregated risk profile (VaR, terminal-price distribution, probability of profit), computed server-side
 
 ### Vault Management
 
@@ -225,7 +235,65 @@ The AI will:
 2. Call `hyperliquid_get_all_mids` for current price
 3. Call `hyperliquid_get_order_book` for depth
 
-### Example 3: Place a Bracket Order
+By default `hyperliquid_get_order_book` returns the top **5** levels per side (pass `depth` for more). The book is served instantly from a live WebSocket mirror when fresh, and each response carries a `source` field (`"websocket"` or `"rest"`) so you know how fresh it is.
+
+### Example 3: Gauge Market Pressure (Microstructure)
+
+```
+Is there buy or sell pressure on HYPE right now, and how tight is the spread?
+```
+
+The AI calls `hyperliquid_get_microstructure` and gets back a dense signal computed server-side (no raw book parsing needed):
+
+```json
+{"asset":"HYPE","source":"websocket","depth":5,"OBI":0.62,"micro_price":1.452,"mid":1.451,"spread_bps":2.1}
+```
+
+- **`OBI`** (Order Book Imbalance) — bid share of top-`depth` volume; `>0.5` means bids are heavier (upward pressure).
+- **`micro_price`** — Stoikov fair value that reacts faster than the plain mid.
+- **`spread_bps`** — bid-ask spread in basis points (tightening ≈ liquid/imminent move, widening ≈ thin).
+
+This is far cheaper on tokens than fetching the raw order book — prefer it when you only need to read market pressure rather than inspect individual levels.
+
+### Example 4: Read Trade Flow (Order Flow / CVD)
+
+```
+Over the last minute, is BTC seeing net buying or selling on Hyperliquid?
+```
+
+The AI calls `hyperliquid_get_orderflow` (optionally with `window_secs`, default 60) and gets a dense signal computed server-side from the executed-trade tape:
+
+```json
+{"asset":"BTC","source":"websocket","window_secs":60,"buy_vol":12.34,"sell_vol":9.87,"CVD":2.47,"TFI":0.111,"trades":143,"vwap":61234.5,"last_px":61240.0,"duration_s":59.8}
+```
+
+- **`buy_vol` / `sell_vol`** — aggressor-signed volume (`"B"` = buy aggressor, `"A"` = sell aggressor).
+- **`CVD`** — cumulative volume delta over the window (`buy_vol − sell_vol`); positive = net buying.
+- **`TFI`** — trade-flow imbalance in `[-1, 1]` (0 = balanced); the flow analog of OBI.
+- **`vwap` / `last_px` / `trades` / `duration_s`** — window VWAP, last print, trade count, and actual span covered.
+
+Where `get_microstructure` reads the *resting book*, `get_orderflow` reads *executed flow* — use them together to see both intent and action.
+
+### Example 5: Simulate Downside Risk (Monte Carlo)
+
+```
+If I hold BTC for the next 7 days, what's my downside risk?
+```
+
+The AI calls `hyperliquid_run_monte_carlo` (defaults: `1h` candles, `lookback_days=30`, `days_forward=7`, `iterations=10000`). The server estimates volatility from recent candles, runs the paths through a vectorized Geometric Brownian Motion model in numpy, and returns only the aggregated risk profile:
+
+```json
+{"asset":"BTC","interval":"1h","days_forward":7,"lookback_days":30,"drift":"zero","s0":61240.0,"steps":168,"iterations":10000,"sigma_per_step":0.0031,"mu_per_step":0.0,"mean_terminal":61230.4,"median_terminal":61180.2,"p05_terminal":56120.7,"p95_terminal":66540.9,"expected_return":-0.0002,"VaR_5pct":0.0836,"prob_profit":0.497}
+```
+
+- **`VaR_5pct`** — 5% Value at Risk as a positive loss magnitude (here ≈ 8.4% worst-case over the horizon at the 5th percentile).
+- **`p05_terminal` / `median_terminal` / `p95_terminal`** — terminal-price percentiles bracketing the outcome distribution.
+- **`prob_profit`** — share of paths ending above the current price.
+- **`drift`** — `"zero"` by default (conservative for risk); pass `use_historical_drift=true` to use the historical mean return as drift.
+
+Only the summary crosses the wire — the thousands of simulated paths never leave the server, so it stays cheap on tokens while doing the heavy compute in Python.
+
+### Example 6: Place a Bracket Order
 
 ```
 Place a bracket order on Hyperliquid:
@@ -254,7 +322,7 @@ This places 3 orders atomically:
 - Take profit trigger at $219.50 (reduce-only)
 - Stop loss trigger at $216.80 (reduce-only)
 
-### Example 4: Check Positions and Close
+### Example 7: Check Positions and Close
 
 ```
 Show me my open positions. If I have a SOL position, close it at market price.
@@ -268,7 +336,7 @@ The AI will:
    - Market order (price = "0")
    - Reduce-only enabled
 
-### Example 5: View Recent Trading Activity
+### Example 8: View Recent Trading Activity
 
 ```
 Show me my last 50 trades from the past 24 hours
