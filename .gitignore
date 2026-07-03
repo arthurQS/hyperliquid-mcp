@@ -60,3 +60,7 @@ uv.lock
 MIGRATION.md
 CHANGELOG_ENV_CONFIG.md
 IMPLEMENTATION.md
+
+# Claude Code internal dev guidance - not needed by end users
+CLAUDE.md
+.claude/
