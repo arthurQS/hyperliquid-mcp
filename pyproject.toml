@@ -5,7 +5,7 @@ description = "Model Context Protocol server for Hyperliquid trading using the o
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-    { name = "Ed", email = "edkdev@proton.me" }
+    { name = "Dakkshin", email = "marketingbizycorp@gmail.com" }
 ]
 license = { text = "MIT" }
 keywords = ["mcp", "hyperliquid", "trading", "model-context-protocol", "ai", "assistant"]
@@ -46,10 +46,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/edkdev/hyperliquid-mcp"
-Repository = "https://github.com/edkdev/hyperliquid-mcp"
-Issues = "https://github.com/edkdev/hyperliquid-mcp/issues"
-Documentation = "https://github.com/edkdev/hyperliquid-mcp#readme"
+Homepage = "https://github.com/Dakkshin/hyperliquid-mcp"
+Repository = "https://github.com/Dakkshin/hyperliquid-mcp"
+Issues = "https://github.com/Dakkshin/hyperliquid-mcp/issues"
+Documentation = "https://github.com/Dakkshin/hyperliquid-mcp#readme"
 
 [project.scripts]
 hyperliquid-mcp = "hyperliquid_mcp.server:main"

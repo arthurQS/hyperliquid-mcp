@@ -45,7 +45,7 @@ mcp-hyperliquid
 
 ```bash
 # Clone and install from source
-git clone https://github.com/edkdev/hyperliquid-mcp.git
+git clone https://github.com/Dakkshin/hyperliquid-mcp.git
 cd hyperliquid-mcp
 uv sync
 
@@ -486,7 +486,7 @@ The AI will show you the complete list of tradeable assets with their indices.
 
 ```bash
 # Clone the repository
-git clone https://github.com/edkdev/hyperliquid-mcp.git
+git clone https://github.com/Dakkshin/hyperliquid-mcp.git
 cd hyperliquid-mcp
 
 # Install dependencies
