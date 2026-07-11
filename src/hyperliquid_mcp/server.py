@@ -956,7 +956,7 @@ class HyperliquidMCPServer:
                         "properties": {
                             "asset": {
                                 "type": "integer",
-                                "description": "Asset index (e.g. 0 for BTC). See hyperliquid_get_meta for the index<->coin mapping.",
+                                "description": "Asset index. ALWAYS resolve via hyperliquid_get_meta first - indices differ between networks (e.g. BTC is 0 on mainnet but 3 on testnet).",
                             },
                             "leverage": {
                                 "type": "integer",
@@ -974,13 +974,13 @@ class HyperliquidMCPServer:
                 # Order Management
                 Tool(
                     name="hyperliquid_place_order",
-                    description="Place a single order on Hyperliquid. Minimum order value is $10. Use asset index from get_meta (e.g., 0=BTC, 1=ETH, 5=SOL).",
+                    description="Place a single order on Hyperliquid. Minimum order value is $10. ALWAYS resolve the asset index via hyperliquid_get_meta first - indices differ between networks (e.g. BTC is 0 on mainnet but 3 on testnet).",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "asset": {
                                 "type": "integer",
-                                "description": "Asset index (e.g., 0 for BTC, 1 for ETH, 5 for SOL). Use hyperliquid_get_meta to get the full list.",
+                                "description": "Asset index. ALWAYS resolve via hyperliquid_get_meta first - indices differ between networks (e.g. BTC is 0 on mainnet but 3 on testnet).",
                                 "minimum": 0,
                             },
                             "isBuy": {
@@ -1021,7 +1021,7 @@ class HyperliquidMCPServer:
                         "properties": {
                             "asset": {
                                 "type": "integer",
-                                "description": "Asset index (e.g., 0 for BTC, 1 for ETH, 5 for SOL)",
+                                "description": "Asset index. ALWAYS resolve via hyperliquid_get_meta first - indices differ between networks (e.g. BTC is 0 on mainnet but 3 on testnet).",
                                 "minimum": 0,
                             },
                             "isBuy": {
@@ -1848,8 +1848,17 @@ class HyperliquidMCPServer:
                 cloid=cloid,
             )
 
-            # Parse response
+            # The top-level message must agree with the parsed status — a
+            # rejected order under an "Order placed" headline reads as success.
             order_info = self._parse_order_response(result)
+            if order_info["status"] == "error":
+                return {
+                    "message": f"Order placement failed for {coin_name}",
+                    "error": order_info["error"],
+                    "data": result,
+                    "orderInfo": order_info,
+                    "requestParams": arguments,
+                }
 
             return {
                 "message": f"Order placed for {coin_name}",
@@ -1971,11 +1980,22 @@ class HyperliquidMCPServer:
             # Parse per-leg statuses: the exchange can return status "ok"
             # with individual legs rejected, and an entry that fills with a
             # rejected SL leg is an unprotected position — that must never
-            # read as "placed successfully".
-            order_infos, failed_legs = self._parse_bracket_result(result)
+            # read as "placed successfully". A normalTpsl group with an
+            # invalid leg is instead rejected atomically (single error
+            # status, nothing rests).
+            order_infos, failed_legs, group_rejected = self._parse_bracket_result(
+                result
+            )
             if failed_legs:
+                if group_rejected:
+                    message = (
+                        "Bracket order rejected by exchange (atomic group"
+                        " reject - no orders were placed)"
+                    )
+                else:
+                    message = "Bracket order partially failed"
                 return {
-                    "message": "Bracket order partially failed",
+                    "message": message,
                     "error": "; ".join(
                         f"{leg['orderType']}: {leg['error']}" for leg in failed_legs
                     ),
@@ -2783,25 +2803,51 @@ class HyperliquidMCPServer:
         return summary
 
     def _parse_bracket_result(self, result: dict) -> tuple:
-        """Parse bulk_orders bracket statuses into (order_infos, failed_legs).
+        """Parse bulk_orders bracket statuses into
+        (order_infos, failed_legs, group_rejected).
 
-        Statuses map positionally to the submitted order list (entry first).
-        The exchange can return status "ok" with per-leg {"error": ...}
-        entries, so each leg must be inspected — an entry that fills while
-        its SL leg was rejected is an unprotected position.
+        Statuses map positionally to the submitted order list (entry first) —
+        but only when the exchange returns one status per order. A normalTpsl
+        group with an invalid leg is rejected ATOMICALLY (verified on
+        testnet): the response carries a SINGLE error status for the whole
+        group and nothing rests, so positional leg attribution would be wrong
+        (the error may describe any leg). group_rejected=True flags that case.
+        Per-leg inspection still matters for the one-status-per-order shape —
+        an entry that fills while its SL leg was rejected is an unprotected
+        position.
         """
         statuses = result.get("response", {}).get("data", {}).get("statuses", [])
         leg_names = ["entry", "take-profit", "stop-loss"]
+        group_rejected = 0 < len(statuses) < len(leg_names) and any(
+            isinstance(s, dict) and "error" in s for s in statuses
+        )
         order_infos = []
         for idx, status in enumerate(statuses):
             info = self._parse_order_status(status)
-            info["orderType"] = leg_names[idx] if idx < len(leg_names) else f"leg-{idx}"
+            if group_rejected:
+                info["orderType"] = "group"
+            else:
+                info["orderType"] = (
+                    leg_names[idx] if idx < len(leg_names) else f"leg-{idx}"
+                )
             order_infos.append(info)
         failed_legs = [i for i in order_infos if i["status"] == "error"]
-        return order_infos, failed_legs
+        return order_infos, failed_legs, group_rejected
 
     def _parse_order_status(self, status: dict) -> dict:
-        """Parse a single order status."""
+        """Parse a single order status.
+
+        Statuses are usually dicts keyed by outcome, but the exchange also
+        uses bare strings: normalTpsl TP/SL children come back as
+        "waitingForFill" (accepted, activates when the entry fills).
+        """
+        if status == "waitingForFill":
+            return {
+                "status": "waitingForFill",
+                "message": "Trigger order accepted; activates when the entry fills",
+            }
+        if not isinstance(status, dict):
+            return {"status": "unknown", "rawStatus": status}
         if "resting" in status:
             return {
                 "status": "resting",

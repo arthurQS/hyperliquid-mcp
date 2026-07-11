@@ -64,3 +64,6 @@ IMPLEMENTATION.md
 # Claude Code internal dev guidance - not needed by end users
 CLAUDE.md
 .claude/
+
+# MCP client config - contains private keys, never commit
+.mcp.json

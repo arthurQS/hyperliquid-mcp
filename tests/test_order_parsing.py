@@ -205,7 +205,7 @@ def _bulk_result(statuses):
 
 class TestParseBracketResult:
     def test_all_legs_ok(self):
-        infos, failed = _inst()._parse_bracket_result(
+        infos, failed, group_rejected = _inst()._parse_bracket_result(
             _bulk_result(
                 [
                     {"filled": {"oid": 1, "totalSz": "1", "avgPx": "100"}},
@@ -214,11 +214,21 @@ class TestParseBracketResult:
                 ]
             )
         )
-        assert failed == []
+        assert failed == [] and group_rejected is False
         assert [i["orderType"] for i in infos] == ["entry", "take-profit", "stop-loss"]
 
+    def test_waiting_for_fill_children_are_not_failures(self):
+        # Live normalTpsl response shape (observed on testnet): entry rests,
+        # TP/SL children come back as the bare string "waitingForFill".
+        infos, failed, group_rejected = _inst()._parse_bracket_result(
+            _bulk_result([{"resting": {"oid": 1}}, "waitingForFill", "waitingForFill"])
+        )
+        assert failed == [] and group_rejected is False
+        assert infos[1]["status"] == "waitingForFill"
+        assert infos[2]["orderType"] == "stop-loss"
+
     def test_rejected_sl_leg_is_flagged(self):
-        infos, failed = _inst()._parse_bracket_result(
+        infos, failed, group_rejected = _inst()._parse_bracket_result(
             _bulk_result(
                 [
                     {"filled": {"oid": 1, "totalSz": "1", "avgPx": "100"}},
@@ -227,13 +237,24 @@ class TestParseBracketResult:
                 ]
             )
         )
-        assert len(failed) == 1
+        assert len(failed) == 1 and group_rejected is False
         assert failed[0]["orderType"] == "stop-loss"
         # The entry leg's state stays visible so the caller knows cleanup is needed.
         assert infos[0]["status"] == "filled"
 
+    def test_atomic_group_reject_single_status(self):
+        # Observed on testnet: an invalid leg rejects the whole normalTpsl
+        # group with ONE error status for three orders — positional leg
+        # attribution would mislabel it as "entry".
+        infos, failed, group_rejected = _inst()._parse_bracket_result(
+            _bulk_result([{"error": "Order has invalid price."}])
+        )
+        assert group_rejected is True
+        assert len(failed) == 1
+        assert failed[0]["orderType"] == "group"
+
     def test_extra_statuses_do_not_crash(self):
-        infos, _ = _inst()._parse_bracket_result(
+        infos, _, _ = _inst()._parse_bracket_result(
             _bulk_result([{"resting": {"oid": i}} for i in range(4)])
         )
         assert infos[3]["orderType"] == "leg-3"
