@@ -329,3 +329,47 @@ class TestGetTradesLiveness:
         inst._recent_trades_rest = lambda coin, cutoff_ms: ["primed"]
         trades, source = inst._get_trades("BTC", window_secs=60)
         assert source == "rest" and trades == ["primed"]
+
+
+# ---------------------------------------------------------------------------
+# _init_hyperliquid failure cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestInitFailureCleanup:
+    def test_ws_disconnected_when_exchange_init_fails(self, monkeypatch):
+        # Info(skip_ws=False) starts non-daemon threads; if Exchange() then
+        # raises, _init_hyperliquid must stop them before re-raising or the
+        # process hangs at exit as a zombie.
+        import hyperliquid_mcp.server as srv
+
+        class FakeInfo:
+            def __init__(self, *a, **k):
+                self.disconnected = False
+                self.coin_to_asset = {}
+
+            def disconnect_websocket(self):
+                self.disconnected = True
+
+        created = {}
+
+        def fake_info(*a, **k):
+            created["info"] = FakeInfo()
+            return created["info"]
+
+        def fake_exchange(*a, **k):
+            raise ConnectionError("transient network failure")
+
+        monkeypatch.setattr(srv, "Info", fake_info)
+        monkeypatch.setattr(srv, "Exchange", fake_exchange)
+
+        inst = object.__new__(S)
+        inst.private_key = "0x" + "11" * 32
+        inst.account_address = None
+        inst.vault_address = None
+        inst.testnet = True
+        inst.perp_dexs_config = ""
+
+        with pytest.raises(ConnectionError):
+            inst._init_hyperliquid()
+        assert created["info"].disconnected is True
