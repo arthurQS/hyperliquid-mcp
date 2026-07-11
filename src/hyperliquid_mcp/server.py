@@ -455,33 +455,47 @@ class HyperliquidMCPServer:
         buy_vol = 0.0
         sell_vol = 0.0
         notional = 0.0
+        total_sz = 0.0
+        unclassified = 0
         last_px = None
+        last_t = None
         min_t = None
         max_t = None
         for t in trades:
             sz = float(t["sz"])
             px = float(t["px"])
-            if t.get("side") == "B":
+            # Only an explicit aggressor tag counts toward signed flow: a
+            # missing/unknown side must not silently skew CVD/TFI (the old
+            # else-branch counted it as sell volume).
+            side = t.get("side")
+            if side == "B":
                 buy_vol += sz
-            else:
+            elif side == "A":
                 sell_vol += sz
+            else:
+                unclassified += 1
             notional += px * sz
-            last_px = px
+            total_sz += sz
             ts = t.get("time", 0)
+            # last_px by max timestamp, not list position: the REST fallback's
+            # ordering is not guaranteed chronological.
+            if last_t is None or ts >= last_t:
+                last_t = ts
+                last_px = px
             min_t = ts if min_t is None else min(min_t, ts)
             max_t = ts if max_t is None else max(max_t, ts)
 
-        total = buy_vol + sell_vol
+        signed_total = buy_vol + sell_vol
         cvd = buy_vol - sell_vol
-        tfi = cvd / total if total else 0.0
-        vwap = notional / total if total else last_px
+        tfi = cvd / signed_total if signed_total else 0.0
+        vwap = notional / total_sz if total_sz else last_px
         duration_s = (
             ((max_t - min_t) / 1000.0)
             if (min_t is not None and max_t is not None)
             else 0.0
         )
 
-        return {
+        out = {
             "buy_vol": round(buy_vol, 6),
             "sell_vol": round(sell_vol, 6),
             "CVD": round(cvd, 6),
@@ -491,6 +505,11 @@ class HyperliquidMCPServer:
             "last_px": round(last_px, 8) if last_px is not None else None,
             "duration_s": round(duration_s, 1),
         }
+        # Only emitted when nonzero (keeps the dense dict small): trades whose
+        # aggressor side wasn't recognized and were excluded from signed flow.
+        if unclassified:
+            out["unclassified"] = unclassified
+        return out
 
     @staticmethod
     def _microstructure(levels: list, depth: int) -> Optional[dict]:
@@ -591,6 +610,10 @@ class HyperliquidMCPServer:
             "s0": round(s0, 8),
             "steps": steps,
             "iterations": iterations,
+            # Sample count behind sigma/m: the candle API caps responses
+            # (~5000), so a long lookback at a fine interval silently
+            # truncates — this is the caller's only way to detect it.
+            "observations": len(arr) - 1,
             "sigma_per_step": round(sigma, 8),
             "mu_per_step": round(m, 8),
             "mean_terminal": round(float(terminal.mean()), 8),
@@ -2274,7 +2297,9 @@ class HyperliquidMCPServer:
 
         elif name == "hyperliquid_get_order_book":
             coin = arguments["coin"]
-            depth = arguments.get("depth", 5)
+            # Clamp: depth 0/negative would slice nonsense ([:-1] drops the
+            # deepest level while claiming the requested depth).
+            depth = max(1, arguments.get("depth", 5))
 
             # Serve from the WS mirror when fresh, else REST (see _get_book).
             result, source = self._get_book(coin)
@@ -2307,7 +2332,7 @@ class HyperliquidMCPServer:
 
         elif name == "hyperliquid_get_microstructure":
             coin = arguments["coin"]
-            depth = arguments.get("depth", 5)
+            depth = max(1, arguments.get("depth", 5))  # same clamp as order book
 
             book, source = self._get_book(coin)
             stats = self._microstructure(book.get("levels") or [[], []], depth)

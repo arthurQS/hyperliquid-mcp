@@ -290,7 +290,12 @@ def _trades_server(trades, last_recv, rest_returns):
 
 
 def _t(offset_secs):
-    return {"time": (time.time() + offset_secs) * 1000, "px": "1", "sz": "1", "side": "B"}
+    return {
+        "time": (time.time() + offset_secs) * 1000,
+        "px": "1",
+        "sz": "1",
+        "side": "B",
+    }
 
 
 class TestGetTradesLiveness:

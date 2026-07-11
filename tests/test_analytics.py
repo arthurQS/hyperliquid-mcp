@@ -347,3 +347,112 @@ class TestBeta:
         closes, _ = bench_closes()
         out = S._beta(closes, closes)
         json.dumps(out)  # must not raise on np.float64/np.bool_
+
+
+# ---------------------------------------------------------------------------
+# Convention-pinning golden values (computed with independent references)
+# ---------------------------------------------------------------------------
+
+# Deterministic 40-close series (seeded random walk, values frozen here).
+GOLDEN_CLOSES = [
+    100.3047,
+    99.2647,
+    100.0152,
+    100.9557,
+    99.0047,
+    97.7025,
+    97.8304,
+    97.5141,
+    97.4973,
+    96.6443,
+    97.5237,
+    98.3015,
+    98.3675,
+    99.4947,
+    99.9623,
+    99.103,
+    99.4717,
+    98.5128,
+    99.3913,
+    99.3414,
+    99.1565,
+    98.4756,
+    99.6981,
+    99.5436,
+    99.1153,
+    98.7631,
+    99.2954,
+    99.6609,
+    100.0736,
+    100.5044,
+    102.6461,
+    102.2397,
+    101.7274,
+    100.9136,
+    101.5296,
+    102.6586,
+    102.5446,
+    101.7045,
+    100.88,
+    101.5306,
+]
+
+
+class TestGoldenConventions:
+    def test_rsi_is_wilder_not_cutler(self):
+        # Wilder RMA gives 54.1270 on this series; Cutler's SMA-RSI gives
+        # 64.1348 — a formula swap fails loudly here.
+        val = S._rsi(np.asarray(GOLDEN_CLOSES), 14)
+        assert val == pytest.approx(54.12701977595044, abs=1e-9)
+
+    def test_bollinger_uses_population_std(self):
+        # ddof=0 upper band is 103.32547; ddof=1 would give 103.39541.
+        out = S._indicators(
+            [str(c) for c in GOLDEN_CLOSES],
+            ["1"] * len(GOLDEN_CLOSES),
+            bb_period=20,
+            bb_stddev=2.0,
+        )
+        assert out["bollinger"]["upper"] == pytest.approx(103.32546739, abs=1e-6)
+        assert out["bollinger"]["lower"] == pytest.approx(97.94065261, abs=1e-6)
+
+    def test_ema_golden_value(self):
+        # SMA-seeded EMA with k=2/(p+1), independently computed.
+        val = S._ema(np.asarray(GOLDEN_CLOSES), 9)
+        assert val == pytest.approx(101.47018887413131, abs=1e-9)
+
+
+class TestOrderflowEdges:
+    def test_last_px_is_max_time_not_list_order(self):
+        # REST fallback ordering is not guaranteed chronological: newest-first
+        # input must still report the newest trade's price as last_px.
+        trades = [
+            _trade(102, 1, "B", 6_000),  # newest, listed first
+            _trade(101, 1, "A", 3_000),
+            _trade(100, 2, "B", 1_000),  # oldest, listed last
+        ]
+        out = S._orderflow(trades, window_secs=60)
+        assert out["last_px"] == 102.0
+
+    def test_unknown_side_not_counted_as_sell(self):
+        trades = [
+            _trade(100, 2, "B", 1_000),
+            {"px": "101", "sz": "5", "time": 2_000},  # no side tag
+        ]
+        out = S._orderflow(trades, window_secs=60)
+        assert out["sell_vol"] == 0.0  # must not absorb the untagged 5.0
+        assert out["buy_vol"] == 2.0
+        assert out["TFI"] == 1.0
+        assert out["unclassified"] == 1
+        # vwap still includes the untagged trade's real notional
+        assert out["vwap"] == round((100 * 2 + 101 * 5) / 7, 8)
+
+
+class TestMonteCarloObservations:
+    def test_reports_sample_count(self):
+        closes = gbm_closes(n=500)
+        out = S._monte_carlo(
+            closes, 100.0, 24, 1000, False, rng=np.random.default_rng(8)
+        )
+        # The only way a caller can detect a truncated candle fetch.
+        assert out["observations"] == len(closes) - 1
