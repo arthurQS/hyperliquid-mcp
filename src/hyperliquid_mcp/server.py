@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -12,6 +13,7 @@ from typing import Any, Optional
 
 import eth_account
 import numpy as np
+import requests
 from eth_account.signers.local import LocalAccount
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
@@ -35,6 +37,27 @@ logger = logging.getLogger(__name__)
 # Environment variables are now loaded from client config (MCP settings)
 # No need for dotenv - variables come from the env section in mcp.json
 
+# Finite timeout for every SDK REST call. The SDK defaults to timeout=None,
+# which requests treats as wait-forever — one hung connection would pin an
+# executor thread for the life of the process, and a few of them starve the
+# to_thread pool and hang the whole server mid-trade. Caveat for write calls:
+# a timeout does NOT mean the order failed — it may have executed after the
+# request was sent; recheck order status before retrying (see call_tool).
+HTTP_TIMEOUT_SECS = 10.0
+
+# Tools that sign and submit state-changing actions. A timeout on one of
+# these must not be read as "the action failed" — see call_tool.
+WRITE_TOOLS = frozenset(
+    {
+        "hyperliquid_place_order",
+        "hyperliquid_place_bracket_order",
+        "hyperliquid_modify_order",
+        "hyperliquid_cancel_order",
+        "hyperliquid_cancel_all_orders",
+        "hyperliquid_update_leverage",
+    }
+)
+
 
 class HyperliquidMCPServer:
     """MCP Server for Hyperliquid trading using the official Python SDK."""
@@ -48,6 +71,13 @@ class HyperliquidMCPServer:
         self.account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
         self.vault_address = os.getenv("HYPERLIQUID_VAULT_ADDRESS")
         self.testnet = os.getenv("HYPERLIQUID_TESTNET", "").lower() == "true"
+        # Which builder (HIP-3) perp dexes to preload alongside the primary dex.
+        # Loading a dex's universe costs one REST round-trip each, and the
+        # network now exposes hundreds of them (237 on testnet), so eager-loading
+        # all of them adds ~90s to startup and blows past the MCP client's 30s
+        # connect timeout. Default to the primary dex only (fast); opt in with a
+        # comma-separated list of dex names, or "all" for the old behavior.
+        self.perp_dexs_config = os.getenv("HYPERLIQUID_PERP_DEXS", "").strip()
 
         if not self.private_key:
             raise ValueError("HYPERLIQUID_PRIVATE_KEY environment variable is required")
@@ -73,6 +103,12 @@ class HyperliquidMCPServer:
         self._trades_last_recv: dict[str, float] = (
             {}
         )  # coin -> wall-clock of last WS trades msg
+        self.local_asset_ctx: dict[str, dict] = (
+            {}
+        )  # coin -> {"ctx", "received_at"} live asset context (incl. openInterest)
+        self._subscribed_asset_ctx: set[str] = (
+            set()
+        )  # coins with a live activeAssetCtx subscription
 
         # Initialize Hyperliquid SDK
         self._init_hyperliquid()
@@ -101,18 +137,37 @@ class HyperliquidMCPServer:
             )
             logger.info(f"Connecting to: {base_url}")
 
-            # Discover all perp dexes (default "" plus any builder-deployed
-            # ones, e.g. the HIP-3 dex hosting equity/commodity perps like
-            # META, AAPL, gold) so their coin names resolve everywhere.
-            bootstrap_info = Info(base_url, skip_ws=True)
-            perp_dex_list = bootstrap_info.perp_dexs()
-            dex_names = [""] + [d["name"] for d in perp_dex_list[1:] if d]
-            logger.info(f"Discovered perp dexes: {dex_names}")
+            # Resolve which perp dexes to load. The primary dex ("") is always
+            # loaded; builder-deployed HIP-3 dexes (e.g. the one hosting equity/
+            # commodity perps like META, AAPL, gold) are loaded only when opted
+            # into via HYPERLIQUID_PERP_DEXS, because loading every discovered
+            # dex's universe (237 on testnet) serially adds ~90s to startup.
+            #   unset/empty -> primary dex only (fast default)
+            #   "all"       -> every discovered dex (old behavior; slow)
+            #   "a,b,c"     -> primary dex plus the named dexes
+            cfg = self.perp_dexs_config.lower()
+            if cfg == "all":
+                bootstrap_info = Info(base_url, skip_ws=True, timeout=HTTP_TIMEOUT_SECS)
+                perp_dex_list = bootstrap_info.perp_dexs()
+                dex_names = [""] + [d["name"] for d in perp_dex_list[1:] if d]
+            elif self.perp_dexs_config:
+                requested = [
+                    d.strip() for d in self.perp_dexs_config.split(",") if d.strip()
+                ]
+                dex_names = [""] + [d for d in requested if d]
+            else:
+                dex_names = [""]
+            logger.info(f"Loading perp dexes: {dex_names}")
 
             # Initialize Info (read-only queries) with all perp dex universes
             # loaded. skip_ws=False starts the SDK's background WebSocket manager
             # (thread-based) so we can subscribe to live l2Book / userFills streams.
-            self.info = Info(base_url, skip_ws=False, perp_dexs=dex_names)
+            self.info = Info(
+                base_url,
+                skip_ws=False,
+                perp_dexs=dex_names,
+                timeout=HTTP_TIMEOUT_SECS,
+            )
 
             # Reverse map for asset-index -> coin-name resolution across all
             # dexes (default dex indices 0..N, builder dexes offset by
@@ -130,6 +185,7 @@ class HyperliquidMCPServer:
                 account_address=self.account_address,
                 vault_address=self.vault_address,
                 perp_dexs=dex_names,
+                timeout=HTTP_TIMEOUT_SECS,
             )
 
             # Verify wallet is registered
@@ -146,6 +202,15 @@ class HyperliquidMCPServer:
 
         except Exception as e:
             logger.error(f"Failed to initialize Hyperliquid SDK: {e}")
+            # Info(skip_ws=False) starts NON-daemon WS + ping threads; if we
+            # re-raise without stopping them, sys.exit(1) in main() blocks
+            # joining them and the "failed" process hangs as a zombie.
+            info = getattr(self, "info", None)
+            if info is not None:
+                try:
+                    info.disconnect_websocket()
+                except Exception:
+                    pass
             raise
 
     # ------------------------------------------------------------------
@@ -273,11 +338,14 @@ class HyperliquidMCPServer:
 
         Trade-stream staleness is not the same as book staleness: a live market
         can be legitimately silent for a while, so silence alone must not force a
-        REST round-trip. We fall back to REST only on cold start (no WS data yet,
-        handles the subscribe->data race) or when the window is empty AND we
-        cannot confirm the socket is alive (no message within cold_secs) — the
-        mandatory guard against a silently-dead socket, since run_forever() does
-        not auto-reconnect.
+        REST round-trip. But the mirror is only trustworthy while the socket is
+        confirmably alive (a message within cold_secs): with a dead socket, the
+        deque's residual trades would serve a tape silently missing its most
+        recent minutes — worse than an empty one, since CVD/TFI/vwap would be
+        computed on it. So ANY read past cold_secs of silence falls back to REST
+        (run_forever() does not auto-reconnect), as does cold start (no WS data
+        yet — the subscribe->data race). Within cold_secs, an empty window is
+        trusted as a real "no flow".
         """
         self._ensure_trades_subscription(coin)
         cutoff_ms = time.time() * 1000 - window_secs * 1000
@@ -290,15 +358,86 @@ class HyperliquidMCPServer:
         if last_recv is None:
             return self._recent_trades_rest(coin, cutoff_ms), "rest"
 
-        windowed = [t for t in snapshot if t.get("time", 0) >= cutoff_ms]
-        if windowed:
-            return windowed, "websocket"
+        if (time.time() - last_recv) >= cold_secs:
+            return self._recent_trades_rest(coin, cutoff_ms), "rest"
 
-        # Empty window: trust the silence if we heard from the socket recently
-        # (a real "no flow"); otherwise fall back to REST as the dead-socket guard.
-        if (time.time() - last_recv) < cold_secs:
-            return [], "websocket"
-        return self._recent_trades_rest(coin, cutoff_ms), "rest"
+        windowed = [t for t in snapshot if t.get("time", 0) >= cutoff_ms]
+        return windowed, "websocket"
+
+    def _on_asset_ctx(self, coin: str, msg: dict) -> None:
+        """WS callback: mirror the latest activeAssetCtx (incl. openInterest).
+
+        The activeAssetCtx stream pushes a full ctx snapshot per message
+        ({"data": {"coin", "ctx": {...}}}), so — like l2Book — maintaining the
+        mirror is just replacing the coin's entry. `coin` is captured via a
+        per-subscription closure so the entry is keyed by the exact requested
+        name (sidesteps any WS name remap).
+        """
+        data = msg.get("data") or {}
+        ctx = data.get("ctx")
+        if not ctx:
+            return
+        with self._state_lock:
+            self.local_asset_ctx[coin] = {"ctx": ctx, "received_at": time.time()}
+
+    def _ensure_asset_ctx_subscription(self, coin: str) -> None:
+        """Subscribe to activeAssetCtx for coin once; safe to call repeatedly."""
+        with self._state_lock:
+            if coin in self._subscribed_asset_ctx:
+                return
+            self._subscribed_asset_ctx.add(coin)
+        try:
+            self.info.subscribe(
+                {"type": "activeAssetCtx", "coin": coin},
+                lambda m, c=coin: self._on_asset_ctx(c, m),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to subscribe activeAssetCtx for {coin}: {e}")
+            with self._state_lock:
+                self._subscribed_asset_ctx.discard(coin)  # allow retry next call
+
+    def _asset_ctx_rest(self, coin: str, dex: str) -> Optional[dict]:
+        """REST pull of a single asset's live ctx (incl. openInterest).
+
+        metaAndAssetCtxs takes no coin, so the coin is matched against the
+        returned universe: by name, by name_to_coin remap, or by the bare name
+        after stripping a "dex:" prefix (builder-dex universes list bare names).
+        Returns None when the coin isn't on the dex.
+        """
+        meta, ctxs = self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
+        universe = meta["universe"]
+        target = self.info.name_to_coin.get(coin, coin)
+        bare = coin.split(":")[-1]
+        for idx, asset in enumerate(universe):
+            if idx >= len(ctxs):
+                break
+            if asset["name"] in (coin, target, bare):
+                return ctxs[idx]
+        return None
+
+    def _get_asset_ctx(
+        self, coin: str, dex: str = "", stale_secs: float = 5.0
+    ) -> tuple[Optional[dict], str]:
+        """Return (ctx, source) for a coin's live context (openInterest, funding,
+        mark/oracle/mid px, day volume).
+
+        Serves the activeAssetCtx WS mirror when fresh (< stale_secs old), else a
+        REST metaAndAssetCtxs pull. Like the book, activeAssetCtx pushes on a
+        regular (per-block) cadence, so plain age-based staleness is the right
+        freshness test (unlike the trade tape, which can be legitimately silent).
+        `ctx` is None only when the coin is unknown on the dex.
+
+        The WS mirror is used for the primary dex only; a non-default `dex` read
+        goes straight to REST (freshness matters most for the hot primary assets,
+        and this dodges any builder-dex WS name-resolution ambiguity).
+        """
+        if not dex:
+            self._ensure_asset_ctx_subscription(coin)
+            with self._state_lock:
+                cached = self.local_asset_ctx.get(coin)
+            if cached and (time.time() - cached["received_at"]) < stale_secs:
+                return cached["ctx"], "websocket"
+        return self._asset_ctx_rest(coin, dex), "rest"
 
     @staticmethod
     def _orderflow(trades: list, window_secs: int) -> Optional[dict]:
@@ -316,33 +455,47 @@ class HyperliquidMCPServer:
         buy_vol = 0.0
         sell_vol = 0.0
         notional = 0.0
+        total_sz = 0.0
+        unclassified = 0
         last_px = None
+        last_t = None
         min_t = None
         max_t = None
         for t in trades:
             sz = float(t["sz"])
             px = float(t["px"])
-            if t.get("side") == "B":
+            # Only an explicit aggressor tag counts toward signed flow: a
+            # missing/unknown side must not silently skew CVD/TFI (the old
+            # else-branch counted it as sell volume).
+            side = t.get("side")
+            if side == "B":
                 buy_vol += sz
-            else:
+            elif side == "A":
                 sell_vol += sz
+            else:
+                unclassified += 1
             notional += px * sz
-            last_px = px
+            total_sz += sz
             ts = t.get("time", 0)
+            # last_px by max timestamp, not list position: the REST fallback's
+            # ordering is not guaranteed chronological.
+            if last_t is None or ts >= last_t:
+                last_t = ts
+                last_px = px
             min_t = ts if min_t is None else min(min_t, ts)
             max_t = ts if max_t is None else max(max_t, ts)
 
-        total = buy_vol + sell_vol
+        signed_total = buy_vol + sell_vol
         cvd = buy_vol - sell_vol
-        tfi = cvd / total if total else 0.0
-        vwap = notional / total if total else last_px
+        tfi = cvd / signed_total if signed_total else 0.0
+        vwap = notional / total_sz if total_sz else last_px
         duration_s = (
             ((max_t - min_t) / 1000.0)
             if (min_t is not None and max_t is not None)
             else 0.0
         )
 
-        return {
+        out = {
             "buy_vol": round(buy_vol, 6),
             "sell_vol": round(sell_vol, 6),
             "CVD": round(cvd, 6),
@@ -352,6 +505,11 @@ class HyperliquidMCPServer:
             "last_px": round(last_px, 8) if last_px is not None else None,
             "duration_s": round(duration_s, 1),
         }
+        # Only emitted when nonzero (keeps the dense dict small): trades whose
+        # aggressor side wasn't recognized and were excluded from signed flow.
+        if unclassified:
+            out["unclassified"] = unclassified
+        return out
 
     @staticmethod
     def _microstructure(levels: list, depth: int) -> Optional[dict]:
@@ -452,6 +610,10 @@ class HyperliquidMCPServer:
             "s0": round(s0, 8),
             "steps": steps,
             "iterations": iterations,
+            # Sample count behind sigma/m: the candle API caps responses
+            # (~5000), so a long lookback at a fine interval silently
+            # truncates — this is the caller's only way to detect it.
+            "observations": len(arr) - 1,
             "sigma_per_step": round(sigma, 8),
             "mu_per_step": round(m, 8),
             "mean_terminal": round(float(terminal.mean()), 8),
@@ -461,6 +623,254 @@ class HyperliquidMCPServer:
             "expected_return": round(float(ret.mean()), 6),
             "VaR_5pct": round(-var5_ret, 6),  # positive = loss magnitude at 5%
             "prob_profit": round(float((terminal > s0).mean()), 4),
+        }
+
+    @staticmethod
+    def _align_candles(asset_candles: list, benchmark_candles: list) -> tuple:
+        """Pair two candle series by shared open-time, returning aligned closes.
+
+        Beta is a regression of one return series on another, so the two series
+        must be sampled at the **same instants** or the slope is meaningless.
+        Candles carry an open-time under key ``"t"`` and a close under ``"c"``
+        (same keys the indicators/monte-carlo handlers read). This intersects on
+        ``t``, sorts ascending, and emits ``(asset_closes, bench_closes)`` as
+        equal-length float-string lists. Both perps trade continuously so the
+        overlap is ~total; the intersection cleanly drops the rare missing
+        candle. Returns ``([], [])`` when there is no shared timestamp.
+        """
+        a_by_t = {c["t"]: c["c"] for c in (asset_candles or [])}
+        b_by_t = {c["t"]: c["c"] for c in (benchmark_candles or [])}
+        common = sorted(set(a_by_t) & set(b_by_t))
+        return [a_by_t[t] for t in common], [b_by_t[t] for t in common]
+
+    @staticmethod
+    def _beta(asset_closes: list, benchmark_closes: list) -> Optional[dict]:
+        """Market beta of an asset vs. a benchmark, from one log-return regression.
+
+        `asset_closes`/`benchmark_closes` are **timestamp-aligned** equal-length
+        chronological close series (strings or floats — align via `_align_candles`
+        first). All figures fall out of regressing the asset's log returns on the
+        benchmark's:
+
+            beta = Cov(asset_ret, bench_ret) / Var(bench_ret)
+
+        beta is the sensitivity (1 = moves 1:1 with the market, >1 amplified,
+        <0 inverse); `correlation` is the confidence gate on that slope (a big
+        beta with low rho is noise); `r_squared` is the share of the asset's
+        variance the benchmark explains; the two per-step vols give the context
+        that makes beta legible (beta = asset_vol/bench_vol * correlation).
+
+        Returns None on bad input — unequal lengths, fewer than 3 closes, any
+        non-positive price (log undefined), or a benchmark with zero/non-finite
+        variance (nothing to regress against). If the *asset* is flat (zero
+        variance), beta is a well-defined 0 but correlation/r_squared are
+        undefined and returned as None. Every scalar is coerced to a Python
+        float — numpy's np.float64 would break json.dumps (same footgun as _rsi).
+        """
+        a = np.asarray([float(x) for x in asset_closes], dtype=float)
+        b = np.asarray([float(x) for x in benchmark_closes], dtype=float)
+        if a.size != b.size or a.size < 3 or (a <= 0).any() or (b <= 0).any():
+            return None
+
+        ra = np.diff(np.log(a))
+        rb = np.diff(np.log(b))
+        var_b = float(rb.var(ddof=1))
+        if var_b == 0.0 or not np.isfinite(var_b):
+            return None
+
+        asset_vol = float(ra.std(ddof=1))
+        bench_vol = float(rb.std(ddof=1))
+        cov = float(np.cov(ra, rb, ddof=1)[0, 1])
+        beta = cov / var_b
+
+        # corr is undefined when the asset is flat (0/0 -> nan); beta stays 0.
+        if asset_vol == 0.0:
+            correlation = None
+            r_squared = None
+        else:
+            correlation = float(np.corrcoef(ra, rb)[0, 1])
+            r_squared = correlation**2
+
+        return {
+            "beta": round(beta, 6),
+            "correlation": round(correlation, 6) if correlation is not None else None,
+            "r_squared": round(r_squared, 6) if r_squared is not None else None,
+            "asset_vol_per_step": round(asset_vol, 8),
+            "benchmark_vol_per_step": round(bench_vol, 8),
+            "observations": int(ra.size),
+        }
+
+    @staticmethod
+    def _ema(arr: np.ndarray, period: int) -> Optional[float]:
+        """Canonical exponential moving average of `arr`, latest value only.
+
+        Seeded with the SMA of the first `period` samples, then smoothed forward
+        with k = 2/(period+1). Returns None if there aren't `period` samples.
+        Reusable "subroutine" — call it per interval to build multi-timeframe EMAs.
+        """
+        n = arr.size
+        if n < period or period <= 0:
+            return None
+        k = 2.0 / (period + 1)
+        ema = float(arr[:period].mean())  # SMA seed
+        for x in arr[period:]:
+            ema = float(x) * k + ema * (1 - k)
+        return ema
+
+    @staticmethod
+    def _rsi(closes: np.ndarray, period: int) -> Optional[float]:
+        """Wilder's RSI (RMA smoothing), latest value only, in [0, 100].
+
+        Seeds the average gain/loss over the first `period` deltas, then applies
+        Wilder's smoothing forward. Returns None if there are fewer than
+        `period + 1` closes. Edge cases: all-gains -> 100, all-losses -> 0.
+        """
+        n = closes.size
+        if n < period + 1 or period <= 0:
+            return None
+        delta = np.diff(closes)
+        gains = np.where(delta > 0, delta, 0.0)
+        losses = np.where(delta < 0, -delta, 0.0)
+        avg_gain = float(gains[:period].mean())
+        avg_loss = float(losses[:period].mean())
+        for i in range(period, delta.size):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0.0:
+            return 100.0 if avg_gain > 0.0 else 50.0  # flat series -> neutral
+        if avg_gain == 0.0:
+            return 0.0
+        rs = avg_gain / avg_loss
+        return float(100.0 - 100.0 / (1.0 + rs))
+
+    @staticmethod
+    def _indicators(
+        closes: list,
+        volumes: list,
+        *,
+        rsi_period: int = 14,
+        bb_period: int = 20,
+        bb_stddev: float = 2.0,
+        vol_sma_period: int = 20,
+        ema_periods: tuple = (9, 21, 50, 200),
+    ) -> Optional[dict]:
+        """Discretionary indicator bundle: RSI, Bollinger Bands, EMAs, Volume SMA.
+
+        `closes`/`volumes` are chronological series (strings or floats). Returns a
+        nested dict pairing each indicator's raw value with **deterministic** flags
+        (mathematical facts, never opinion) so a small model can branch on booleans
+        instead of doing float math. An indicator whose window exceeds the data
+        yields a null `value` (rather than failing the whole call); returns None
+        only when there isn't even enough data for the smallest indicator.
+        """
+        c = np.asarray([float(x) for x in closes], dtype=float)
+        v = np.asarray([float(x) for x in volumes], dtype=float)
+        if c.size < rsi_period + 1 or (c <= 0).any():
+            return None
+        price = float(c[-1])
+
+        # --- RSI ---
+        rsi_val = HyperliquidMCPServer._rsi(c, rsi_period)
+        rsi: dict[str, Any] = {
+            "value": round(rsi_val, 4) if rsi_val is not None else None,
+            "period": rsi_period,
+            "zone": None,
+            "is_overbought": None,
+            "is_oversold": None,
+        }
+        if rsi_val is not None:
+            rsi["is_overbought"] = rsi_val > 70
+            rsi["is_oversold"] = rsi_val < 30
+            rsi["zone"] = (
+                "OVERBOUGHT"
+                if rsi_val > 70
+                else "OVERSOLD" if rsi_val < 30 else "NEUTRAL"
+            )
+
+        # --- Bollinger Bands (population std, ddof=0 — the charting convention) ---
+        bb: dict = {
+            "period": bb_period,
+            "stddev": bb_stddev,
+            "upper": None,
+            "middle": None,
+            "lower": None,
+            "percent_b": None,
+            "bandwidth": None,
+            "price_vs_bands": None,
+            "is_squeeze": None,
+        }
+        if c.size >= bb_period and bb_period > 0:
+            window = c[-bb_period:]
+            middle = float(window.mean())
+            sd = float(window.std(ddof=0))
+            upper = middle + bb_stddev * sd
+            lower = middle - bb_stddev * sd
+            bb["middle"] = round(middle, 8)
+            bb["upper"] = round(upper, 8)
+            bb["lower"] = round(lower, 8)
+            bb["bandwidth"] = (
+                round((upper - lower) / middle, 8) if middle != 0 else None
+            )
+            bb["percent_b"] = (
+                round((price - lower) / (upper - lower), 6) if upper != lower else None
+            )
+            bb["price_vs_bands"] = (
+                "ABOVE_UPPER"
+                if price > upper
+                else "BELOW_LOWER" if price < lower else "INSIDE"
+            )
+            # Deterministic squeeze: current bandwidth is at its trailing minimum.
+            bandwidths = []
+            for i in range(bb_period, c.size + 1):
+                w = c[i - bb_period : i]
+                mu = float(w.mean())
+                if mu != 0:
+                    bandwidths.append(2 * bb_stddev * float(w.std(ddof=0)) / mu)
+            bb["is_squeeze"] = (
+                bool(bandwidths and bandwidths[-1] <= min(bandwidths))
+                if bandwidths
+                else None
+            )
+
+        # --- EMAs (reusable subroutine per length) ---
+        ema: dict[str, Any] = {"is_ordered_up": None, "is_ordered_down": None}
+        ema_vals = {}
+        for p in ema_periods:
+            val = HyperliquidMCPServer._ema(c, int(p))
+            ema_vals[int(p)] = val
+            ema[str(int(p))] = {
+                "value": round(val, 8) if val is not None else None,
+                "price_is_above": (price > val) if val is not None else None,
+            }
+        ordered = [ema_vals[int(p)] for p in ema_periods]
+        if all(x is not None for x in ordered):
+            o = [float(x) for x in ordered if x is not None]
+            ema["is_ordered_up"] = all(o[i] > o[i + 1] for i in range(len(o) - 1))
+            ema["is_ordered_down"] = all(o[i] < o[i + 1] for i in range(len(o) - 1))
+
+        # --- Volume SMA ---
+        vol: dict = {
+            "period": vol_sma_period,
+            "current": None,
+            "sma": None,
+            "ratio": None,
+            "above_sma": None,
+        }
+        if v.size >= 1:
+            vol["current"] = round(float(v[-1]), 8)
+        if v.size >= vol_sma_period and vol_sma_period > 0:
+            sma = float(v[-vol_sma_period:].mean())
+            vol["sma"] = round(sma, 8)
+            if sma != 0:
+                vol["ratio"] = round(float(v[-1]) / sma, 4)
+                vol["above_sma"] = float(v[-1]) > sma
+
+        return {
+            "price": round(price, 8),
+            "rsi": rsi,
+            "bollinger": bb,
+            "ema": ema,
+            "volume": vol,
         }
 
     def _start_streams(self) -> None:
@@ -538,16 +948,39 @@ class HyperliquidMCPServer:
                         },
                     },
                 ),
-                # Order Management
                 Tool(
-                    name="hyperliquid_place_order",
-                    description="Place a single order on Hyperliquid. Minimum order value is $10. Use asset index from get_meta (e.g., 0=BTC, 1=ETH, 5=SOL).",
+                    name="hyperliquid_update_leverage",
+                    description="Set the leverage AND margin mode for a perp asset. update_leverage configures both at once: the leverage multiplier and whether the asset uses cross margin (isCross=true) or isolated margin (isCross=false). Leverage is capped at the asset's maxLeverage (see hyperliquid_get_meta); the exchange rejects out-of-range values and the error is surfaced.",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "asset": {
                                 "type": "integer",
-                                "description": "Asset index (e.g., 0 for BTC, 1 for ETH, 5 for SOL). Use hyperliquid_get_meta to get the full list.",
+                                "description": "Asset index. ALWAYS resolve via hyperliquid_get_meta first - indices differ between networks (e.g. BTC is 0 on mainnet but 3 on testnet).",
+                            },
+                            "leverage": {
+                                "type": "integer",
+                                "description": "Leverage multiplier (e.g. 5 for 5x). Must be <= the asset's maxLeverage.",
+                            },
+                            "isCross": {
+                                "type": "boolean",
+                                "description": "Margin mode: true = cross margin (default), false = isolated margin.",
+                                "default": True,
+                            },
+                        },
+                        "required": ["asset", "leverage"],
+                    },
+                ),
+                # Order Management
+                Tool(
+                    name="hyperliquid_place_order",
+                    description="Place a single order on Hyperliquid. Minimum order value is $10. ALWAYS resolve the asset index via hyperliquid_get_meta first - indices differ between networks (e.g. BTC is 0 on mainnet but 3 on testnet).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "asset": {
+                                "type": "integer",
+                                "description": "Asset index. ALWAYS resolve via hyperliquid_get_meta first - indices differ between networks (e.g. BTC is 0 on mainnet but 3 on testnet).",
                                 "minimum": 0,
                             },
                             "isBuy": {
@@ -588,7 +1021,7 @@ class HyperliquidMCPServer:
                         "properties": {
                             "asset": {
                                 "type": "integer",
-                                "description": "Asset index (e.g., 0 for BTC, 1 for ETH, 5 for SOL)",
+                                "description": "Asset index. ALWAYS resolve via hyperliquid_get_meta first - indices differ between networks (e.g. BTC is 0 on mainnet but 3 on testnet).",
                                 "minimum": 0,
                             },
                             "isBuy": {
@@ -854,6 +1287,24 @@ class HyperliquidMCPServer:
                     },
                 ),
                 Tool(
+                    name="hyperliquid_get_open_interest",
+                    description="Get open interest and live market context (funding rate, mark/oracle/mid price, 24h volume) for a perp asset. Open interest is returned in both base units and USD notional (base * mark price). Omit 'coin' to get a list for every asset on the dex, sorted by notional OI. Defaults to the main perp dex; pass 'dex' for a builder-deployed dex.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "coin": {
+                                "type": "string",
+                                "description": "Asset symbol (e.g., 'BTC', 'ETH', 'SOL'). For builder-dex assets use the dex-prefixed name (e.g. 'xyz:META'). Omit to return all assets on the dex.",
+                            },
+                            "dex": {
+                                "type": "string",
+                                "description": "Perp dex name (optional, defaults to the main dex)",
+                                "default": "",
+                            },
+                        },
+                    },
+                ),
+                Tool(
                     name="hyperliquid_get_perp_dexs",
                     description="List all available perp dexes, including builder-deployed ones (e.g. the dex hosting equity/commodity perps like META, AAPL, gold). Use the returned dex names with hyperliquid_get_meta/hyperliquid_get_all_mids to inspect a specific dex.",
                     inputSchema={"type": "object", "properties": {}},
@@ -990,6 +1441,46 @@ class HyperliquidMCPServer:
                     },
                 ),
                 Tool(
+                    name="hyperliquid_get_indicators",
+                    description="Compute the classic discretionary technical-indicator bundle (RSI, Bollinger Bands, EMA 9/21/50/200, Volume SMA) server-side from recent candles, in one call. Returns raw values AND deterministic derived flags (e.g. rsi_zone, price_is_above each EMA, price_vs_bands, is_ordered_up) - mathematical facts only, never trading opinions - so a downstream model branches on booleans instead of doing float math. Single interval per call: call twice (e.g. '1h' then '1d') for multi-timeframe context.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "coin": {
+                                "type": "string",
+                                "description": "Asset symbol (e.g., 'BTC', 'ETH', 'SOL'). For builder-deployed dex assets like equities/commodities, use the dex-prefixed name (e.g. 'xyz:META' for Meta Platforms) - see hyperliquid_get_perp_dexs and hyperliquid_get_meta.",
+                            },
+                            "interval": {
+                                "type": "string",
+                                "description": "Candle interval to compute indicators on (optional, default '1h')",
+                                "enum": ["1m", "5m", "15m", "1h", "4h", "1d"],
+                                "default": "1h",
+                            },
+                            "rsi_period": {
+                                "type": "integer",
+                                "description": "RSI lookback period (optional, default 14)",
+                                "default": 14,
+                            },
+                            "bb_period": {
+                                "type": "integer",
+                                "description": "Bollinger Bands SMA period (optional, default 20)",
+                                "default": 20,
+                            },
+                            "bb_stddev": {
+                                "type": "number",
+                                "description": "Bollinger Bands standard-deviation multiplier (optional, default 2)",
+                                "default": 2,
+                            },
+                            "vol_sma_period": {
+                                "type": "integer",
+                                "description": "Volume SMA period (optional, default 20)",
+                                "default": 20,
+                            },
+                        },
+                        "required": ["coin"],
+                    },
+                ),
+                Tool(
                     name="hyperliquid_run_monte_carlo",
                     description="Run a vectorized Geometric Brownian Motion (GBM) Monte Carlo price simulation and return an aggregated risk profile (terminal-price distribution, 5% Value-at-Risk, probability of profit). Volatility (and optionally drift) is estimated from recent candles; thousands of paths are simulated server-side and only the summary is returned.",
                     inputSchema={
@@ -1027,6 +1518,35 @@ class HyperliquidMCPServer:
                             },
                         },
                         "required": ["coin"],
+                    },
+                ),
+                Tool(
+                    name="hyperliquid_get_beta",
+                    description="Compute an asset's market beta against a benchmark from a single log-return regression over aligned candles. Beta = Cov(asset,benchmark)/Var(benchmark): the asset's sensitivity to the benchmark (1 = moves 1:1, >1 amplified, <0 inverse) - useful for position sizing and spotting when two positions are secretly the same market bet. Returns descriptive coupling facts only (beta, correlation, r_squared, per-step vols), never trading opinions. Benchmark is required (commonly 'BTC' as the crypto market proxy); there is no implicit default.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "coin": {
+                                "type": "string",
+                                "description": "Asset symbol to measure (e.g., 'ETH', 'SOL'). For builder-deployed dex assets use the dex-prefixed name (e.g. 'xyz:META') - see hyperliquid_get_perp_dexs and hyperliquid_get_meta.",
+                            },
+                            "benchmark": {
+                                "type": "string",
+                                "description": "Benchmark symbol to regress against, i.e. 'the market' (e.g. 'BTC'). Required - there is no implicit default.",
+                            },
+                            "interval": {
+                                "type": "string",
+                                "description": "Candle interval used to compute returns (optional, default '1h')",
+                                "enum": ["1m", "5m", "15m", "1h", "4h", "1d"],
+                                "default": "1h",
+                            },
+                            "lookback_days": {
+                                "type": "integer",
+                                "description": "How many days of history to estimate beta over (optional, default 30)",
+                                "default": 30,
+                            },
+                        },
+                        "required": ["coin", "benchmark"],
                     },
                 ),
                 # Vault Management
@@ -1085,13 +1605,21 @@ class HyperliquidMCPServer:
                 ]
             except Exception as e:
                 logger.error(f"Tool {name} failed: {e}", exc_info=True)
+                payload = {"error": str(e), "tool": name, "arguments": arguments}
+                # A read timeout on a write means the signed request may have
+                # reached the exchange and executed — "failed" would be a lie.
+                if name in WRITE_TOOLS and isinstance(
+                    e, requests.exceptions.ReadTimeout
+                ):
+                    payload["warning"] = (
+                        "Request timed out AFTER being sent - the action may"
+                        " still have executed. Recheck order status / open"
+                        " orders / positions before retrying."
+                    )
                 return [
                     TextContent(
                         type="text",
-                        text=json.dumps(
-                            {"error": str(e), "tool": name, "arguments": arguments},
-                            separators=(",", ":"),
-                        ),
+                        text=json.dumps(payload, separators=(",", ":")),
                     )
                 ]
 
@@ -1105,6 +1633,7 @@ class HyperliquidMCPServer:
         # Normalize integer parameters (convert float to int if needed)
         integer_params = [
             "asset",
+            "leverage",
             "oid",
             "startTime",
             "endTime",
@@ -1115,21 +1644,13 @@ class HyperliquidMCPServer:
             "days_forward",
             "iterations",
             "lookback_days",
+            "rsi_period",
+            "bb_period",
+            "vol_sma_period",
         ]
         for param in integer_params:
             if param in arguments and arguments[param] is not None:
-                try:
-                    arguments[param] = int(float(arguments[param]))
-                    logger.debug(
-                        f"Normalized {param} parameter: {arguments[param]} (type: {type(arguments[param])})"
-                    )
-                except (ValueError, TypeError) as e:
-                    logger.error(
-                        f"Failed to convert {param} parameter to integer: {arguments.get(param)} - {e}"
-                    )
-                    raise ValueError(
-                        f"Invalid {param} parameter: {arguments.get(param)}. Must be a valid integer."
-                    )
+                arguments[param] = self._coerce_int(param, arguments[param])
 
         # Get user address (use configured account if not provided; `or` also
         # covers clients that send an explicit null)
@@ -1170,24 +1691,93 @@ class HyperliquidMCPServer:
 
         elif name == "hyperliquid_get_balance":
             dex = arguments.get("dex", "")
+            # Hyperliquid keeps two independent ledgers: the PERP account
+            # (clearinghouseState) and the SPOT account (spotClearinghouseState).
+            # user_state only sees perps, so a wallet whose funds sit in spot
+            # reports a $0 perp balance. Query both and surface them together.
             result = self.info.user_state(user_address, dex=dex)
             margin_summary = result["marginSummary"]
+            perp_withdrawable = result["withdrawable"]
+
+            # Spot balances (list of {coin, token, total, hold, entryNtl}); spot
+            # is dex-independent, so it's queried once regardless of `dex`.
+            spot_balances: list = []
+            spot_usdc = "0.0"
+            try:
+                spot_state = self.info.spot_user_state(user_address)
+                spot_balances = spot_state.get("balances", []) or []
+                for bal in spot_balances:
+                    if bal.get("coin") == "USDC":
+                        spot_usdc = bal.get("total", "0.0")
+            except Exception as e:
+                logger.warning(f"Failed to fetch spot balance: {e}")
+
+            # Non-zero spot holdings, keyed by coin, for a compact summary view.
+            spot_summary = {
+                b["coin"]: b["total"]
+                for b in spot_balances
+                if float(b.get("total", "0") or "0") > 0
+            }
+            perp_available = float(margin_summary["accountValue"]) - float(
+                margin_summary["totalMarginUsed"]
+            )
+
             return {
                 "message": "Balance retrieved successfully",
                 "data": {
-                    "accountValue": margin_summary["accountValue"],
-                    "totalMarginUsed": margin_summary["totalMarginUsed"],
-                    "totalNtlPos": margin_summary["totalNtlPos"],
-                    "totalRawUsd": margin_summary["totalRawUsd"],
-                    "withdrawable": result["withdrawable"],
+                    "perp": {
+                        "accountValue": margin_summary["accountValue"],
+                        "totalMarginUsed": margin_summary["totalMarginUsed"],
+                        "totalNtlPos": margin_summary["totalNtlPos"],
+                        "totalRawUsd": margin_summary["totalRawUsd"],
+                        "withdrawable": perp_withdrawable,
+                    },
+                    "spot": {
+                        "usdc": spot_usdc,
+                        "balances": spot_balances,
+                    },
                 },
                 "summary": {
-                    "accountValue": margin_summary["accountValue"],
-                    "withdrawable": result["withdrawable"],
-                    "availableBalance": str(
-                        float(margin_summary["accountValue"])
-                        - float(margin_summary["totalMarginUsed"])
+                    "perpAccountValue": margin_summary["accountValue"],
+                    "perpWithdrawable": perp_withdrawable,
+                    "perpAvailableBalance": str(perp_available),
+                    "spotUsdc": spot_usdc,
+                    "spotHoldings": spot_summary,
+                    # Cash you could trade with right now: free perp margin +
+                    # spot USDC (spot has to be transferred to perp to trade perps).
+                    "totalUsdcAcrossAccounts": str(
+                        perp_available + float(spot_usdc or "0")
                     ),
+                },
+            }
+
+        elif name == "hyperliquid_update_leverage":
+            asset = arguments["asset"]  # Already normalized to integer
+            leverage = arguments["leverage"]  # Already normalized to integer
+            is_cross = arguments.get("isCross", True)
+
+            # Convert asset index to coin name (same guard as place_order)
+            coin_name = self.asset_index_to_name.get(asset)
+            if coin_name is None:
+                raise ValueError(f"Unknown asset index: {asset}")
+
+            result = self.exchange.update_leverage(leverage, coin_name, is_cross)
+
+            # Surface a request-level rejection (e.g. leverage above maxLeverage)
+            # cleanly instead of returning an opaque {"status": "err"} blob.
+            err = self._top_level_error(result)
+            if err is not None:
+                return {"error": err, "requestParams": arguments}
+
+            mode = "cross" if is_cross else "isolated"
+            return {
+                "message": f"Leverage set to {leverage}x ({mode}) for {coin_name}",
+                "data": result,
+                "summary": {
+                    "asset": asset,
+                    "coin": coin_name,
+                    "leverage": leverage,
+                    "marginMode": mode,
                 },
             }
 
@@ -1195,10 +1785,12 @@ class HyperliquidMCPServer:
         elif name == "hyperliquid_place_order":
             asset = arguments["asset"]  # Already normalized to integer
             is_buy = arguments["isBuy"]
-            size = float(arguments["size"])
+            size = self._positive_float("size", arguments["size"])
             # Keep price as string if provided, convert to float for SDK
             price_str = arguments.get("price", "0")
             price = float(price_str) if price_str else 0.0
+            if price != 0.0:
+                price = self._positive_float("price", price)
             reduce_only = arguments.get("reduceOnly", False)
             order_type = arguments.get("orderType", {"limit": {"tif": "Gtc"}})
             cloid_str = arguments.get("cloid")
@@ -1211,11 +1803,32 @@ class HyperliquidMCPServer:
             # Create cloid if provided
             cloid = Cloid(cloid_str) if cloid_str else None
 
-            # Handle trigger orders: convert triggerPx string to float
+            # Handle trigger orders
             if "trigger" in order_type:
                 trigger = order_type["trigger"]
-                if "triggerPx" in trigger and isinstance(trigger["triggerPx"], str):
-                    trigger["triggerPx"] = float(trigger["triggerPx"])
+                if "triggerPx" not in trigger:
+                    raise ValueError("Trigger orders require a triggerPx")
+                trigger["triggerPx"] = self._positive_float(
+                    "triggerPx", trigger["triggerPx"]
+                )
+                if price == 0.0:
+                    if trigger.get("isMarket"):
+                        # A trigger-market with limit_px 0 could never execute
+                        # after triggering (a stop that doesn't stop). Bound it
+                        # around the trigger price like the bracket SL: the
+                        # slippage-bounded worst acceptable fill.
+                        price = self.exchange._slippage_price(
+                            coin_name,
+                            is_buy,
+                            Exchange.DEFAULT_SLIPPAGE,
+                            px=trigger["triggerPx"],
+                        )
+                    else:
+                        raise ValueError(
+                            "Non-market trigger orders require an explicit"
+                            " positive price (the limit to rest after"
+                            " triggering)"
+                        )
             elif price == 0.0:
                 # Hyperliquid has no native market orders: a resting buy limit
                 # at 0 would never fill. Emulate market like the SDK's
@@ -1235,8 +1848,17 @@ class HyperliquidMCPServer:
                 cloid=cloid,
             )
 
-            # Parse response
+            # The top-level message must agree with the parsed status — a
+            # rejected order under an "Order placed" headline reads as success.
             order_info = self._parse_order_response(result)
+            if order_info["status"] == "error":
+                return {
+                    "message": f"Order placement failed for {coin_name}",
+                    "error": order_info["error"],
+                    "data": result,
+                    "orderInfo": order_info,
+                    "requestParams": arguments,
+                }
 
             return {
                 "message": f"Order placed for {coin_name}",
@@ -1248,10 +1870,19 @@ class HyperliquidMCPServer:
         elif name == "hyperliquid_place_bracket_order":
             asset = arguments["asset"]  # Already normalized to integer
             is_buy = arguments["isBuy"]
-            size = float(arguments["size"])
-            entry_price = float(arguments.get("entryPrice", 0))
-            tp_price = float(arguments["takeProfitPrice"])
-            sl_price = float(arguments["stopLossPrice"])
+            size = self._positive_float("size", arguments["size"])
+            # entryPrice 0/omitted means market entry; anything else must be a
+            # real price. TP/SL must always be: stopLossPrice 0 would both
+            # trigger nonsensically and make _slippage_price silently
+            # substitute the mid for the SL's limit bound (its `if not px`
+            # fallback).
+            entry_price = float(arguments.get("entryPrice", 0) or 0)
+            if entry_price != 0.0:
+                entry_price = self._positive_float("entryPrice", entry_price)
+            tp_price = self._positive_float(
+                "takeProfitPrice", arguments["takeProfitPrice"]
+            )
+            sl_price = self._positive_float("stopLossPrice", arguments["stopLossPrice"])
             reduce_only = arguments.get("reduceOnly", False)
             entry_order_type = arguments.get(
                 "entryOrderType", {"limit": {"tif": "Gtc"}}
@@ -1270,6 +1901,10 @@ class HyperliquidMCPServer:
                     coin_name, is_buy, Exchange.DEFAULT_SLIPPAGE
                 )
                 entry_order_type = {"limit": {"tif": "Ioc"}}
+
+            # Geometry check runs after market-entry resolution so the TP/SL
+            # are validated against the price the entry will actually target.
+            self._validate_bracket_geometry(is_buy, entry_price, tp_price, sl_price)
 
             # The stop-loss triggers as MARKET (isMarket True): a limit SL can
             # gap through its price and never fill, defeating the stop. Its
@@ -1323,16 +1958,51 @@ class HyperliquidMCPServer:
                 },
             ]
 
-            result = self.exchange.bulk_orders(orders)
+            # normalTpsl ties the TP and SL to the entry as a native OCO pair:
+            # when one fills the exchange auto-cancels the sibling, and
+            # cancelling the entry cancels both. Without this (grouping defaults
+            # to "na") the three orders are independent and a filled side leaves
+            # its stale sibling resting on the book.
+            result = self.exchange.bulk_orders(orders, grouping="normalTpsl")
 
-            # Parse response for all three orders
-            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-            order_infos = []
-            for idx, status in enumerate(statuses):
-                order_type = ["entry", "take-profit", "stop-loss"][idx]
-                info = self._parse_order_status(status)
-                info["orderType"] = order_type
-                order_infos.append(info)
+            # Surface a top-level rejection (unapproved agent wallet,
+            # insufficient margin, ...) instead of crashing in the parse
+            # chain: on failure `response` is a string, not a statuses dict.
+            err = self._top_level_error(result)
+            if err is not None:
+                return {
+                    "message": "Bracket order placement failed",
+                    "error": err,
+                    "data": result,
+                    "requestParams": arguments,
+                }
+
+            # Parse per-leg statuses: the exchange can return status "ok"
+            # with individual legs rejected, and an entry that fills with a
+            # rejected SL leg is an unprotected position — that must never
+            # read as "placed successfully". A normalTpsl group with an
+            # invalid leg is instead rejected atomically (single error
+            # status, nothing rests).
+            order_infos, failed_legs, group_rejected = self._parse_bracket_result(
+                result
+            )
+            if failed_legs:
+                if group_rejected:
+                    message = (
+                        "Bracket order rejected by exchange (atomic group"
+                        " reject - no orders were placed)"
+                    )
+                else:
+                    message = "Bracket order partially failed"
+                return {
+                    "message": message,
+                    "error": "; ".join(
+                        f"{leg['orderType']}: {leg['error']}" for leg in failed_legs
+                    ),
+                    "data": result,
+                    "orders": order_infos,
+                    "requestParams": arguments,
+                }
 
             return {
                 "message": "Bracket order placed successfully",
@@ -1347,6 +2017,15 @@ class HyperliquidMCPServer:
 
             result = self.exchange.cancel(coin, oid)
 
+            summary = self._parse_cancel_result(result, [{"coin": coin, "oid": oid}])
+            if summary["failedCount"]:
+                return {
+                    "message": f"Cancel failed for order {oid} ({coin})",
+                    "error": summary.get("error", "unrecognized cancel status"),
+                    "data": result,
+                    "requestParams": arguments,
+                }
+
             return {
                 "message": f"Order {oid} cancelled for {coin}",
                 "data": result,
@@ -1356,8 +2035,10 @@ class HyperliquidMCPServer:
         elif name == "hyperliquid_cancel_all_orders":
             dex = arguments.get("dex", "")
 
-            # Get all open orders
-            open_orders = self.info.open_orders(user_address, dex=dex)
+            # frontend_open_orders (not open_orders) so untriggered TP/SL
+            # trigger orders are included — "cancel all" that leaves stale
+            # stops resting would fire them later against a flat book.
+            open_orders = self.info.frontend_open_orders(user_address, dex=dex)
 
             if not open_orders:
                 return {
@@ -1373,20 +2054,39 @@ class HyperliquidMCPServer:
 
             result = self.exchange.bulk_cancel(cancel_requests)
 
-            return {
-                "message": f"Cancelled {len(cancel_requests)} orders",
+            # An order can legitimately fill between the open-orders fetch and
+            # the cancel — report per-oid outcomes so the caller re-checks
+            # instead of assuming everything it saw is now gone.
+            summary = self._parse_cancel_result(result, cancel_requests)
+            response = {
+                "message": (
+                    f"Cancelled {summary['cancelledCount']} of "
+                    f"{len(cancel_requests)} orders"
+                ),
                 "data": result,
-                "cancelledCount": len(cancel_requests),
+                "cancelledCount": summary["cancelledCount"],
+                "failedCount": summary["failedCount"],
+                "outcomes": summary["outcomes"],
             }
+            if "error" in summary:
+                response["error"] = summary["error"]
+            return response
 
         elif name == "hyperliquid_modify_order":
             oid = arguments["oid"]  # Already normalized to integer
             coin = arguments["coin"]
             is_buy = arguments["isBuy"]
-            size = float(arguments["size"])
-            price = float(arguments["price"])
+            size = self._positive_float("size", arguments["size"])
+            price = self._positive_float("price", arguments["price"])
             reduce_only = arguments.get("reduceOnly", False)
             order_type = arguments.get("orderType", {"limit": {"tif": "Gtc"}})
+
+            # Same coercion as place_order: a string triggerPx would die deep
+            # in the SDK's float_to_wire with an opaque TypeError.
+            if "trigger" in order_type:
+                trigger = order_type["trigger"]
+                if "triggerPx" in trigger and isinstance(trigger["triggerPx"], str):
+                    trigger["triggerPx"] = float(trigger["triggerPx"])
 
             result = self.exchange.modify_order(
                 oid=oid,
@@ -1398,9 +2098,22 @@ class HyperliquidMCPServer:
                 reduce_only=reduce_only,
             )
 
+            # A rejected modify must never read as success: the caller may be
+            # "moving a stop" and would otherwise believe the position is
+            # protected at the new price.
+            order_info = self._parse_order_response(result)
+            if order_info["status"] == "error":
+                return {
+                    "message": f"Order {oid} modification failed",
+                    "error": order_info["error"],
+                    "data": result,
+                    "requestParams": arguments,
+                }
+
             return {
                 "message": f"Order {oid} modified successfully",
                 "data": result,
+                "orderInfo": order_info,
                 "modifiedOrder": {
                     "orderId": oid,
                     "coin": coin,
@@ -1514,6 +2227,75 @@ class HyperliquidMCPServer:
                 },
             }
 
+        elif name == "hyperliquid_get_open_interest":
+            dex = arguments.get("dex", "")
+            coin = arguments.get("coin")
+
+            def _oi_row(asset_name: str, ctx: dict) -> dict:
+                oi_base = float(ctx.get("openInterest", "0") or "0")
+                # Notional = base OI * mark px (fall back to mid/oracle).
+                px = ctx.get("markPx") or ctx.get("midPx") or ctx.get("oraclePx")
+                px_f = float(px) if px else 0.0
+                return {
+                    "coin": asset_name,
+                    "openInterest": ctx.get("openInterest"),
+                    "openInterestNotional": round(oi_base * px_f, 2),
+                    "funding": ctx.get("funding"),
+                    "markPx": ctx.get("markPx"),
+                    "oraclePx": ctx.get("oraclePx"),
+                    "midPx": ctx.get("midPx"),
+                    "dayNtlVlm": ctx.get("dayNtlVlm"),
+                    "prevDayPx": ctx.get("prevDayPx"),
+                }
+
+            if coin:
+                # Single asset: served from the activeAssetCtx WS mirror when
+                # fresh (O(1), no REST), else a REST metaAndAssetCtxs pull.
+                ctx, source = self._get_asset_ctx(coin, dex)
+                if ctx is None:
+                    return {
+                        "error": f"Unknown coin '{coin}' on dex '{dex or 'main'}'. Use hyperliquid_get_meta to list assets."
+                    }
+                row = _oi_row(coin, ctx)
+                return {
+                    "message": f"Open interest for {coin} retrieved successfully",
+                    "data": {**row, "source": source},
+                    "summary": {
+                        "coin": coin,
+                        "openInterest": row["openInterest"],
+                        "openInterestNotional": row["openInterestNotional"],
+                        "funding": row["funding"],
+                        "markPx": row["markPx"],
+                        "source": source,
+                    },
+                }
+
+            # All assets on the dex: one bulk REST pull (the WS mirror is
+            # per-coin, so it can't serve a full-universe scan). openInterest
+            # lives in metaAndAssetCtxs, not meta; post directly with `dex` so
+            # builder dexes work (mirrors how meta(dex=) does it).
+            meta, ctxs = self.info.post(
+                "/info", {"type": "metaAndAssetCtxs", "dex": dex}
+            )
+            universe = meta["universe"]
+            rows = [
+                _oi_row(asset["name"], ctxs[idx])
+                for idx, asset in enumerate(universe)
+                if idx < len(ctxs)
+            ]
+            rows.sort(key=lambda r: r["openInterestNotional"], reverse=True)
+            return {
+                "message": "Open interest for all assets retrieved successfully",
+                "data": rows,
+                "summary": {
+                    "dex": dex,
+                    "numberOfAssets": len(rows),
+                    "totalOpenInterestNotional": round(
+                        sum(r["openInterestNotional"] for r in rows), 2
+                    ),
+                },
+            }
+
         elif name == "hyperliquid_get_perp_dexs":
             result = self.info.perp_dexs()
 
@@ -1535,7 +2317,9 @@ class HyperliquidMCPServer:
 
         elif name == "hyperliquid_get_order_book":
             coin = arguments["coin"]
-            depth = arguments.get("depth", 5)
+            # Clamp: depth 0/negative would slice nonsense ([:-1] drops the
+            # deepest level while claiming the requested depth).
+            depth = max(1, arguments.get("depth", 5))
 
             # Serve from the WS mirror when fresh, else REST (see _get_book).
             result, source = self._get_book(coin)
@@ -1568,7 +2352,7 @@ class HyperliquidMCPServer:
 
         elif name == "hyperliquid_get_microstructure":
             coin = arguments["coin"]
-            depth = arguments.get("depth", 5)
+            depth = max(1, arguments.get("depth", 5))  # same clamp as order book
 
             book, source = self._get_book(coin)
             stats = self._microstructure(book.get("levels") or [[], []], depth)
@@ -1657,6 +2441,69 @@ class HyperliquidMCPServer:
                 },
             }
 
+        elif name == "hyperliquid_get_indicators":
+            coin = arguments["coin"]
+            interval = arguments.get("interval", "1h")
+            rsi_period = arguments.get("rsi_period", 14)
+            bb_period = arguments.get("bb_period", 20)
+            bb_stddev = float(arguments.get("bb_stddev", 2))
+            vol_sma_period = arguments.get("vol_sma_period", 20)
+
+            # Fetch enough history to seed the 200-EMA well (~3x its length is a
+            # common convergence rule); the horizon and estimation interval match.
+            minutes_per = {
+                "1m": 1,
+                "5m": 5,
+                "15m": 15,
+                "1h": 60,
+                "4h": 240,
+                "1d": 1440,
+            }.get(interval)
+            if minutes_per is None:
+                return {"asset": coin, "error": f"unsupported interval: {interval}"}
+            now_ms = int(time.time() * 1000)
+            start_time = now_ms - 600 * minutes_per * 60_000
+
+            candles = self.info.candles_snapshot(
+                name=coin,
+                interval=interval,
+                startTime=start_time,
+                endTime=now_ms,
+            )
+            closes = [c["c"] for c in candles] if candles else []
+            volumes = [c["v"] for c in candles] if candles else []
+            if len(closes) < 3:
+                return {
+                    "asset": coin,
+                    "error": "insufficient history",
+                    "interval": interval,
+                    "candles": len(closes),
+                }
+
+            stats = self._indicators(
+                closes,
+                volumes,
+                rsi_period=rsi_period,
+                bb_period=bb_period,
+                bb_stddev=bb_stddev,
+                vol_sma_period=vol_sma_period,
+            )
+            if stats is None:
+                return {
+                    "asset": coin,
+                    "error": "insufficient history",
+                    "interval": interval,
+                    "candles": len(closes),
+                }
+            # Dense nested dict - no message/data/summary wrapper by design: raw
+            # values paired with deterministic flags for cheap downstream branching.
+            return {
+                "asset": coin,
+                "interval": interval,
+                "candles": len(closes),
+                **stats,
+            }
+
         elif name == "hyperliquid_run_monte_carlo":
             coin = arguments["coin"]
             days_forward = arguments.get("days_forward", 7)
@@ -1723,6 +2570,59 @@ class HyperliquidMCPServer:
                 **stats,
             }
 
+        elif name == "hyperliquid_get_beta":
+            coin = arguments["coin"]
+            benchmark = arguments["benchmark"]
+            interval = arguments.get("interval", "1h")
+            lookback_days = arguments.get("lookback_days", 30)
+
+            now_ms = int(time.time() * 1000)
+            start_time = now_ms - lookback_days * 86400 * 1000
+            # Fetch both series over the same window/interval; align on shared
+            # candle open-times so the regression compares like-for-like instants.
+            asset_candles = self.info.candles_snapshot(
+                name=coin,
+                interval=interval,
+                startTime=start_time,
+                endTime=now_ms,
+            )
+            bench_candles = self.info.candles_snapshot(
+                name=benchmark,
+                interval=interval,
+                startTime=start_time,
+                endTime=now_ms,
+            )
+            asset_closes, bench_closes = self._align_candles(
+                asset_candles, bench_candles
+            )
+            if len(asset_closes) < 3:
+                return {
+                    "asset": coin,
+                    "benchmark": benchmark,
+                    "error": "insufficient overlapping history",
+                    "interval": interval,
+                    "candles": len(asset_closes),
+                }
+
+            stats = self._beta(asset_closes, bench_closes)
+            if stats is None:
+                return {
+                    "asset": coin,
+                    "benchmark": benchmark,
+                    "error": "insufficient history or zero benchmark volatility",
+                    "interval": interval,
+                    "candles": len(asset_closes),
+                }
+            # Flat dense dict (no message/data/summary wrapper) like run_monte_carlo:
+            # already-normalized risk scalars that speak for themselves.
+            return {
+                "asset": coin,
+                "benchmark": benchmark,
+                "interval": interval,
+                "lookback_days": lookback_days,
+                **stats,
+            }
+
         # Vault Management
         elif name == "hyperliquid_vault_details":
             vault_address = arguments["vaultAddress"]
@@ -1759,15 +2659,195 @@ class HyperliquidMCPServer:
         else:
             raise ValueError(f"Unknown tool: {name}")
 
+    @staticmethod
+    def _coerce_int(name: str, value: Any) -> int:
+        """Coerce a numeric argument to int, rejecting non-integral values.
+
+        Clients sometimes send integers as floats ("5.0"), which is fine —
+        but truncating a genuinely fractional value would silently target
+        the wrong thing (asset 5.7 -> the wrong instrument, oid 123.9 ->
+        the wrong order), so those raise instead.
+        """
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid {name} parameter: {value!r}. Must be a valid integer."
+            )
+        if not math.isfinite(f) or f != int(f):
+            raise ValueError(
+                f"Invalid {name} parameter: {value!r}. Must be a whole number."
+            )
+        return int(f)
+
+    @staticmethod
+    def _validate_bracket_geometry(
+        is_buy: bool, entry_price: float, tp_price: float, sl_price: float
+    ) -> None:
+        """Reject a bracket whose TP/SL sit on the wrong side of the entry.
+
+        A wrong-side stop triggers the instant it hits the book — a
+        reduce-only market close at up to 5% slippage — so this must fail
+        before anything is signed. Longs need SL < entry < TP; shorts the
+        mirror.
+        """
+        if is_buy:
+            if not (sl_price < entry_price < tp_price):
+                raise ValueError(
+                    f"Invalid bracket for long: require stopLossPrice < entryPrice"
+                    f" < takeProfitPrice, got SL {sl_price}, entry {entry_price},"
+                    f" TP {tp_price}"
+                )
+        else:
+            if not (tp_price < entry_price < sl_price):
+                raise ValueError(
+                    f"Invalid bracket for short: require takeProfitPrice <"
+                    f" entryPrice < stopLossPrice, got TP {tp_price}, entry"
+                    f" {entry_price}, SL {sl_price}"
+                )
+
+    @staticmethod
+    def _positive_float(name: str, value: Any) -> float:
+        """Coerce a size/price argument to a finite positive float.
+
+        This must run before anything reaches signing: the SDK's
+        float_to_wire guard (``abs(x) >= 1e-12``) is False for NaN, so a
+        "NaN" size would be signed and posted verbatim, and inf/negative
+        values likewise rely entirely on exchange-side rejection.
+        """
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid {name}: {value!r}. Must be a number.")
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(
+                f"Invalid {name}: {value!r}. Must be a finite positive number."
+            )
+        return v
+
+    @staticmethod
+    def _top_level_error(result: Any) -> Optional[str]:
+        """Extract a top-level API failure message, if any.
+
+        On a request-level rejection (bad/unapproved agent wallet,
+        insufficient margin, min order value, ...) the exchange returns
+        ``{"status": "err", "response": "<error string>"}`` — ``response``
+        is a *string*, not the usual ``{"data": {"statuses": [...]}}`` dict.
+        Blindly calling ``.get("data")`` on it raises AttributeError, which
+        would mask the real error behind an opaque parse crash. Returns the
+        error string when the result is such a failure (or not a dict at
+        all), else None.
+        """
+        if not isinstance(result, dict):
+            return str(result)
+        if result.get("status") == "err":
+            resp = result.get("response")
+            return resp if isinstance(resp, str) else str(resp)
+        return None
+
     def _parse_order_response(self, result: dict) -> dict:
         """Parse order placement response."""
+        err = self._top_level_error(result)
+        if err is not None:
+            return {
+                "status": "error",
+                "error": err,
+                "message": "Order placement failed",
+            }
         order_status = (
             result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
         )
         return self._parse_order_status(order_status)
 
+    def _parse_cancel_result(self, result: Any, requested: list) -> dict:
+        """Summarize a cancel/bulk_cancel response against the requested orders.
+
+        The exchange reports per-order outcomes in ``statuses`` — the string
+        ``"success"`` or ``{"error": "..."}`` (e.g. "Order was never placed,
+        already canceled, or filled.") — and can also fail top-level. A cancel
+        that silently failed leaves a live order the caller believes is gone,
+        so anything that isn't an explicit success is counted as failed.
+        """
+        err = self._top_level_error(result)
+        if err is not None:
+            return {
+                "cancelledCount": 0,
+                "failedCount": len(requested),
+                "error": err,
+                "outcomes": [
+                    {**req, "status": "error", "error": err} for req in requested
+                ],
+            }
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        outcomes = []
+        cancelled = 0
+        errors = []
+        for i, req in enumerate(requested):
+            status = statuses[i] if i < len(statuses) else None
+            if status == "success":
+                cancelled += 1
+                outcomes.append({**req, "status": "success"})
+            elif isinstance(status, dict) and "error" in status:
+                errors.append(f"oid {req.get('oid')}: {status['error']}")
+                outcomes.append({**req, "status": "error", "error": status["error"]})
+            else:
+                errors.append(f"oid {req.get('oid')}: unrecognized cancel status")
+                outcomes.append({**req, "status": "unknown", "rawStatus": status})
+        summary = {
+            "cancelledCount": cancelled,
+            "failedCount": len(requested) - cancelled,
+            "outcomes": outcomes,
+        }
+        if errors:
+            summary["error"] = "; ".join(errors)
+        return summary
+
+    def _parse_bracket_result(self, result: dict) -> tuple:
+        """Parse bulk_orders bracket statuses into
+        (order_infos, failed_legs, group_rejected).
+
+        Statuses map positionally to the submitted order list (entry first) —
+        but only when the exchange returns one status per order. A normalTpsl
+        group with an invalid leg is rejected ATOMICALLY (verified on
+        testnet): the response carries a SINGLE error status for the whole
+        group and nothing rests, so positional leg attribution would be wrong
+        (the error may describe any leg). group_rejected=True flags that case.
+        Per-leg inspection still matters for the one-status-per-order shape —
+        an entry that fills while its SL leg was rejected is an unprotected
+        position.
+        """
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        leg_names = ["entry", "take-profit", "stop-loss"]
+        group_rejected = 0 < len(statuses) < len(leg_names) and any(
+            isinstance(s, dict) and "error" in s for s in statuses
+        )
+        order_infos = []
+        for idx, status in enumerate(statuses):
+            info = self._parse_order_status(status)
+            if group_rejected:
+                info["orderType"] = "group"
+            else:
+                info["orderType"] = (
+                    leg_names[idx] if idx < len(leg_names) else f"leg-{idx}"
+                )
+            order_infos.append(info)
+        failed_legs = [i for i in order_infos if i["status"] == "error"]
+        return order_infos, failed_legs, group_rejected
+
     def _parse_order_status(self, status: dict) -> dict:
-        """Parse a single order status."""
+        """Parse a single order status.
+
+        Statuses are usually dicts keyed by outcome, but the exchange also
+        uses bare strings: normalTpsl TP/SL children come back as
+        "waitingForFill" (accepted, activates when the entry fills).
+        """
+        if status == "waitingForFill":
+            return {
+                "status": "waitingForFill",
+                "message": "Trigger order accepted; activates when the entry fills",
+            }
+        if not isinstance(status, dict):
+            return {"status": "unknown", "rawStatus": status}
         if "resting" in status:
             return {
                 "status": "resting",

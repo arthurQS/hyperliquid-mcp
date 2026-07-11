@@ -140,6 +140,106 @@ class TestMonteCarlo:
 
 
 # ---------------------------------------------------------------------------
+# _indicators / _ema / _rsi
+# ---------------------------------------------------------------------------
+
+
+def _ref_ema(arr, period):
+    """Independent reference EMA (SMA seed + k=2/(period+1)) for cross-check."""
+    k = 2.0 / (period + 1)
+    ema = float(np.mean(arr[:period]))
+    for x in arr[period:]:
+        ema = float(x) * k + ema * (1 - k)
+    return ema
+
+
+class TestEMA:
+    def test_matches_reference(self):
+        arr = np.asarray([float(x) for x in range(1, 61)], dtype=float)
+        for p in (9, 21, 50):
+            assert math.isclose(S._ema(arr, p), _ref_ema(arr, p), rel_tol=1e-12)
+
+    def test_insufficient_returns_none(self):
+        assert S._ema(np.arange(5, dtype=float), 9) is None
+
+
+class TestRSI:
+    def test_rising_series_maxes_out(self):
+        closes = np.asarray([100.0 + i for i in range(30)], dtype=float)
+        assert S._rsi(closes, 14) == 100.0  # only gains
+
+    def test_falling_series_bottoms_out(self):
+        closes = np.asarray([100.0 - i for i in range(30)], dtype=float)
+        assert S._rsi(closes, 14) == 0.0  # only losses
+
+    def test_range_and_seeding(self):
+        rng = np.random.default_rng(9)
+        closes = 100.0 + np.cumsum(rng.standard_normal(100))
+        val = S._rsi(closes, 14)
+        assert 0.0 <= val <= 100.0
+
+    def test_insufficient_returns_none(self):
+        assert S._rsi(np.arange(10, dtype=float), 14) is None
+
+
+class TestIndicators:
+    def _rising_closes(self, n=260):
+        return [str(100.0 + i) for i in range(n)]
+
+    def test_rising_series_flags(self):
+        closes = self._rising_closes()
+        vols = ["10"] * len(closes)
+        out = S._indicators(closes, vols)
+        # Strong uptrend: RSI overbought, price above every EMA, EMAs stacked up.
+        assert out["rsi"]["is_overbought"] is True
+        assert out["rsi"]["zone"] == "OVERBOUGHT"
+        for p in ("9", "21", "50", "200"):
+            assert out["ema"][p]["price_is_above"] is True
+        assert out["ema"]["is_ordered_up"] is True
+        assert out["ema"]["is_ordered_down"] is False
+        assert out["price"] == float(closes[-1])
+
+    def test_ema200_null_when_short_history_but_tool_returns(self):
+        closes = [str(100.0 + i) for i in range(60)]  # < 200
+        vols = ["1"] * len(closes)
+        out = S._indicators(closes, vols)
+        assert out is not None
+        assert out["ema"]["200"]["value"] is None
+        assert out["ema"]["9"]["value"] is not None
+        # ordering undefined when any EMA is missing
+        assert out["ema"]["is_ordered_up"] is None
+
+    def test_bollinger_percent_b_and_bands(self):
+        # Constant series -> zero-width bands (bandwidth 0, percent_b undefined).
+        flat = ["50"] * 30
+        out = S._indicators(flat, ["1"] * 30, rsi_period=14)
+        assert out["bollinger"]["bandwidth"] == 0.0
+        assert out["bollinger"]["percent_b"] is None
+        assert out["bollinger"]["price_vs_bands"] == "INSIDE"
+
+    def test_bollinger_price_above_upper(self):
+        closes = ["10"] * 19 + ["100"]  # last close spikes above the band
+        out = S._indicators(closes, ["1"] * 20, rsi_period=14, bb_period=20)
+        assert out["bollinger"]["price_vs_bands"] == "ABOVE_UPPER"
+        assert out["bollinger"]["percent_b"] > 1.0
+
+    def test_volume_sma(self):
+        closes = self._rising_closes(30)
+        vols = ["10"] * 29 + ["30"]  # last volume is 3x the baseline
+        out = S._indicators(closes, vols, vol_sma_period=20)
+        assert out["volume"]["current"] == 30.0
+        assert out["volume"]["above_sma"] is True
+        assert out["volume"]["ratio"] > 1.0
+
+    def test_insufficient_returns_none(self):
+        assert S._indicators(["100", "101"], ["1", "1"], rsi_period=14) is None
+
+    def test_non_positive_close_returns_none(self):
+        closes = ["100"] * 14 + ["-1"]
+        assert S._indicators(closes, ["1"] * 15, rsi_period=14) is None
+
+
+# ---------------------------------------------------------------------------
 # _parse_order_status
 # ---------------------------------------------------------------------------
 
@@ -163,3 +263,196 @@ class TestParseOrderStatus:
 
     def test_unknown(self):
         assert self.parse({"weird": 1})["status"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# _align_candles
+# ---------------------------------------------------------------------------
+
+
+def _candle(t, c):
+    return {"t": t, "c": str(c)}
+
+
+class TestAlignCandles:
+    def test_intersects_and_sorts(self):
+        a = [_candle(3, 30), _candle(1, 10), _candle(2, 20)]  # out of order
+        b = [_candle(2, 200), _candle(3, 300), _candle(9, 900)]  # 9 unshared
+        ac, bc = S._align_candles(a, b)
+        assert ac == ["20", "30"]  # sorted by t, only shared 2 & 3
+        assert bc == ["200", "300"]
+
+    def test_disjoint_returns_empty(self):
+        ac, bc = S._align_candles([_candle(1, 10)], [_candle(2, 20)])
+        assert ac == [] and bc == []
+
+    def test_handles_empty_input(self):
+        assert S._align_candles(None, None) == ([], [])
+        assert S._align_candles([], [_candle(1, 1)]) == ([], [])
+
+
+# ---------------------------------------------------------------------------
+# _beta
+# ---------------------------------------------------------------------------
+
+
+def bench_closes(n=300, sigma=0.02, s0=100.0, seed=11):
+    rng = np.random.default_rng(seed)
+    logret = sigma * rng.standard_normal(n)
+    return list(s0 * np.exp(np.cumsum(logret))), logret
+
+
+class TestBeta:
+    def test_self_beta_is_one(self):
+        closes, _ = bench_closes()
+        out = S._beta(closes, closes)
+        assert out["beta"] == pytest.approx(1.0, abs=1e-9)
+        assert out["correlation"] == pytest.approx(1.0, abs=1e-9)
+        assert out["r_squared"] == pytest.approx(1.0, abs=1e-9)
+        assert out["observations"] == len(closes) - 1
+
+    def test_scaled_series_beta_two(self):
+        # Asset log returns are exactly 2x the benchmark's -> beta == 2, rho == 1.
+        b, rb = bench_closes()
+        a = list(100.0 * np.exp(np.cumsum(2.0 * rb)))
+        out = S._beta(a, b)
+        assert out["beta"] == pytest.approx(2.0, abs=1e-9)
+        assert out["correlation"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_anticorrelated_beta_negative(self):
+        b, rb = bench_closes()
+        a = list(100.0 * np.exp(np.cumsum(-rb)))  # exact mirror
+        out = S._beta(a, b)
+        assert out["beta"] == pytest.approx(-1.0, abs=1e-9)
+        assert out["correlation"] == pytest.approx(-1.0, abs=1e-9)
+        assert out["r_squared"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_flat_asset_beta_zero_corr_none(self):
+        b, _ = bench_closes()
+        a = [100.0] * len(b)  # zero variance
+        out = S._beta(a, b)
+        assert out["beta"] == 0.0
+        assert out["correlation"] is None and out["r_squared"] is None
+
+    def test_bad_inputs_return_none(self):
+        b, _ = bench_closes(n=10)
+        assert S._beta([100, 101], [100, 101]) is None  # <3 closes
+        assert S._beta(b, b[:-1]) is None  # mismatched lengths
+        assert S._beta([100, 100, 100], [100, 100, 100]) is None  # zero bench var
+        assert S._beta([100, -1, 102], [100, 101, 102]) is None  # log(<=0)
+
+    def test_returns_are_json_safe(self):
+        import json
+
+        closes, _ = bench_closes()
+        out = S._beta(closes, closes)
+        json.dumps(out)  # must not raise on np.float64/np.bool_
+
+
+# ---------------------------------------------------------------------------
+# Convention-pinning golden values (computed with independent references)
+# ---------------------------------------------------------------------------
+
+# Deterministic 40-close series (seeded random walk, values frozen here).
+GOLDEN_CLOSES = [
+    100.3047,
+    99.2647,
+    100.0152,
+    100.9557,
+    99.0047,
+    97.7025,
+    97.8304,
+    97.5141,
+    97.4973,
+    96.6443,
+    97.5237,
+    98.3015,
+    98.3675,
+    99.4947,
+    99.9623,
+    99.103,
+    99.4717,
+    98.5128,
+    99.3913,
+    99.3414,
+    99.1565,
+    98.4756,
+    99.6981,
+    99.5436,
+    99.1153,
+    98.7631,
+    99.2954,
+    99.6609,
+    100.0736,
+    100.5044,
+    102.6461,
+    102.2397,
+    101.7274,
+    100.9136,
+    101.5296,
+    102.6586,
+    102.5446,
+    101.7045,
+    100.88,
+    101.5306,
+]
+
+
+class TestGoldenConventions:
+    def test_rsi_is_wilder_not_cutler(self):
+        # Wilder RMA gives 54.1270 on this series; Cutler's SMA-RSI gives
+        # 64.1348 — a formula swap fails loudly here.
+        val = S._rsi(np.asarray(GOLDEN_CLOSES), 14)
+        assert val == pytest.approx(54.12701977595044, abs=1e-9)
+
+    def test_bollinger_uses_population_std(self):
+        # ddof=0 upper band is 103.32547; ddof=1 would give 103.39541.
+        out = S._indicators(
+            [str(c) for c in GOLDEN_CLOSES],
+            ["1"] * len(GOLDEN_CLOSES),
+            bb_period=20,
+            bb_stddev=2.0,
+        )
+        assert out["bollinger"]["upper"] == pytest.approx(103.32546739, abs=1e-6)
+        assert out["bollinger"]["lower"] == pytest.approx(97.94065261, abs=1e-6)
+
+    def test_ema_golden_value(self):
+        # SMA-seeded EMA with k=2/(p+1), independently computed.
+        val = S._ema(np.asarray(GOLDEN_CLOSES), 9)
+        assert val == pytest.approx(101.47018887413131, abs=1e-9)
+
+
+class TestOrderflowEdges:
+    def test_last_px_is_max_time_not_list_order(self):
+        # REST fallback ordering is not guaranteed chronological: newest-first
+        # input must still report the newest trade's price as last_px.
+        trades = [
+            _trade(102, 1, "B", 6_000),  # newest, listed first
+            _trade(101, 1, "A", 3_000),
+            _trade(100, 2, "B", 1_000),  # oldest, listed last
+        ]
+        out = S._orderflow(trades, window_secs=60)
+        assert out["last_px"] == 102.0
+
+    def test_unknown_side_not_counted_as_sell(self):
+        trades = [
+            _trade(100, 2, "B", 1_000),
+            {"px": "101", "sz": "5", "time": 2_000},  # no side tag
+        ]
+        out = S._orderflow(trades, window_secs=60)
+        assert out["sell_vol"] == 0.0  # must not absorb the untagged 5.0
+        assert out["buy_vol"] == 2.0
+        assert out["TFI"] == 1.0
+        assert out["unclassified"] == 1
+        # vwap still includes the untagged trade's real notional
+        assert out["vwap"] == round((100 * 2 + 101 * 5) / 7, 8)
+
+
+class TestMonteCarloObservations:
+    def test_reports_sample_count(self):
+        closes = gbm_closes(n=500)
+        out = S._monte_carlo(
+            closes, 100.0, 24, 1000, False, rng=np.random.default_rng(8)
+        )
+        # The only way a caller can detect a truncated candle fetch.
+        assert out["observations"] == len(closes) - 1

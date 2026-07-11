@@ -1,251 +1,130 @@
-# Hyperliquid MCP - Quick Start Guide
+# Quickstart
 
-Get trading on Hyperliquid with AI in 5 minutes!
+Zero to signed order in about five minutes. The long version lives in [README.md](README.md); this is the short one.
 
-## Prerequisites Check
+## 0. Prereqs (30 seconds)
 
 ```bash
-# Check Python version (need 3.10+)
-python --version
-
-# Install uv if not installed
-pip install uv
+python --version   # need 3.10+
+pip install uv     # if you don't have uv/uvx yet
 ```
 
-## Step 1: Register Your Wallet (2 minutes)
+## 1. Register your wallet (2 minutes)
 
-### For Mainnet:
-1. Go to https://app.hyperliquid.xyz
-2. Connect your MetaMask or wallet
-3. Click "Deposit" and bridge any amount from Arbitrum One
-   - Even $10 USDC works - this registers your wallet
+Hyperliquid doesn't know you exist until you deposit. Pick a lane:
 
-### For Testnet:
-1. Go to https://app.hyperliquid-testnet.xyz
-2. Connect your wallet
-3. Use the faucet or bridge testnet funds
+- **Testnet (start here):** https://app.hyperliquid-testnet.xyz -> connect wallet -> faucet. Free money, real order book.
+- **Mainnet:** https://app.hyperliquid.xyz -> connect -> deposit anything from Arbitrum. $10 is plenty; the deposit itself is the registration.
 
-**✅ Checkpoint:** You should see a balance on Hyperliquid's UI
+Checkpoint: the Hyperliquid UI shows a balance. No balance, no trading — every write will bounce with `User or API Wallet does not exist` until this is done.
 
-## Step 2: Configure the MCP (1 minute)
+## 2. Wire up your MCP client (1 minute)
 
-### Option A: Direct Environment Variables (Simplest)
+Add this to your client's MCP config. For Claude Desktop that's:
 
-Edit your Claude Desktop config directly:
-
-**Windows:** `%APPDATA%\Claude\claude_desktop_config.json`  
-**Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Claude Code:** `claude mcp add-json hyperliquid '<the json below>'`
 
 ```json
 {
   "mcpServers": {
     "hyperliquid": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/yourusername/hyperliquid-mcp.git", "hyperliquid-mcp"],
+      "args": ["--from", "mcp-hyperliquid", "hyperliquid-mcp"],
       "env": {
-        "HYPERLIQUID_PRIVATE_KEY": "0xYOUR_PRIVATE_KEY_HERE",
-        "HYPERLIQUID_TESTNET": "false"
+        "HYPERLIQUID_PRIVATE_KEY": "0xYOUR_KEY",
+        "HYPERLIQUID_TESTNET": "true"
       }
     }
   }
 }
 ```
 
-### Option B: Local Installation
+Two things, no negotiation:
 
-```bash
-# Clone and setup
-git clone <repo-url> hyperliquid-mcp
-cd hyperliquid-mcp
+1. That key can sign orders. The config file is now key material — keep it out of git, screenshots, and pastebins.
+2. There is no `.env` file. The server reads its environment from this `env` block and nowhere else.
 
-# Create .env file
-cp .env.example .env
+Running from a local clone instead of PyPI:
 
-# Edit .env with your private key
-nano .env
-# Set: HYPERLIQUID_PRIVATE_KEY=0xYourKeyHere
-
-# Configure Claude Desktop to use local version
-```
-
-Config for local:
 ```json
-{
-  "mcpServers": {
-    "hyperliquid": {
-      "command": "uv",
-      "args": ["run", "--directory", "D:\\path\\mcp\\hyperliquid-mcp", "python", "-m", "hyperliquid_mcp.server"]
-    }
-  }
-}
+"command": "uv",
+"args": ["--directory", "/path/to/hyperliquid-mcp", "run", "python", "-m", "hyperliquid_mcp.server"]
 ```
 
-**✅ Checkpoint:** Config file saved and closed
+Checkpoint: config saved, JSON actually valid (trailing commas kill more MCP setups than anything else).
 
-## Step 3: Restart Claude Desktop (30 seconds)
+## 3. Restart the client (30 seconds)
 
-1. **Completely quit** Claude Desktop (not just close window)
-   - Windows: Right-click system tray icon → Exit
-   - Mac: Cmd+Q or Claude → Quit Claude
+Fully quit — kill the process, not the window — and reopen. Then confirm the server is listed: Claude Desktop shows connected MCP servers in the tools menu; Claude Code shows them under `/mcp`.
 
-2. **Restart** Claude Desktop
+If it's missing: bad JSON, or the key doesn't start with `0x`. That's 95% of failures right there.
 
-3. **Verify** the MCP loaded:
-   - Look for the 🔌 icon in Claude's interface
-   - Click it to see "hyperliquid" listed
+## 4. Prove it works (30 seconds)
 
-**✅ Checkpoint:** You see "hyperliquid" in the MCP list
-
-## Step 4: Test It! (30 seconds)
-
-Try these commands in Claude:
-
-### Test 1: Check Connection
-```
-Show me my Hyperliquid account balance
-```
-
-Expected: Shows your account value, margin, and withdrawable amount
-
-### Test 2: Get Market Data
-```
-What's the current price of BTC, ETH, and SOL on Hyperliquid?
-```
-
-Expected: Shows current prices for all three assets
-
-### Test 3: View Asset List
-```
-Show me all tradeable assets on Hyperliquid with their indices
-```
-
-Expected: Complete list of assets with index numbers (BTC=0, ETH=1, SOL=5, etc.)
-
-**✅ Checkpoint:** All three commands work!
-
-## Step 5: Place Your First Order (Optional - 1 minute)
-
-### Practice with a Small Order
+Say these to your model, in order:
 
 ```
-Place a test order on Hyperliquid:
-- Asset: SOL
-- Side: BUY
-- Size: 0.05 SOL (about $10)
-- Price: [current price - 10%] (so it won't fill)
-- Type: Limit order
-
-Just to test, we'll cancel it right after.
+Show me my Hyperliquid balance
 ```
 
-Expected: Order places successfully, you get an order ID
+Expect perp AND spot balances. They're separate ledgers — money in spot shows $0 on the perp side until transferred. Not a bug.
 
-### Cancel the Test Order
+```
+What are BTC, ETH, and SOL trading at on Hyperliquid?
+```
+
+Expect three live mid prices.
+
+```
+Show me tradeable assets on Hyperliquid with their indices
+```
+
+Expect the full universe from `get_meta`. Do not memorize these numbers: **indices differ per network** — BTC is 0 on mainnet and 3 on testnet. The model resolves them per call; let it.
+
+All three answered? You're live.
+
+## 5. First order (1 minute, optional but do it)
+
+```
+Place a limit buy on Hyperliquid: 0.05 SOL, priced 10% below the current
+market so it rests without filling. We'll cancel it right after.
+```
+
+Expect an order ID and status `resting`. Then:
 
 ```
 Cancel all my open orders on Hyperliquid
 ```
 
-Expected: Test order is cancelled
+Expect an honest per-order outcome — `cancelledCount: 1`, not vibes. If a cancel ever fails, the response says `Cancel failed` with the exchange's reason. This server does not report success it didn't get.
 
-**✅ Checkpoint:** You successfully placed and cancelled an order!
+You placed and killed an order. The write path works. ¯\\_(ツ)_/¯
 
-## Common Issues & Fixes
+## When it doesn't work
 
-### Issue: "User or API Wallet does not exist"
+**`User or API Wallet does not exist`** — Step 1 skipped or incomplete, or (agent mode) the API wallet isn't approved on *this* network. Testnet and mainnet approvals are completely separate.
 
-**Fix:** Your wallet isn't registered yet
-- Go back to Step 1
-- Make sure you deposited funds on Hyperliquid
-- Wait 1-2 minutes for registration to process
+**Server not listed after restart** — JSON syntax. Validate the file. Then check the key starts with `0x`. Then actually quit the client, not just the window.
 
-### Issue: MCP not showing in Claude
+**`Order value must be at least $10`** — exchange minimum: `size x price >= $10`. 0.05 SOL at $200 clears it; 0.01 doesn't.
 
-**Fix:** Configuration problem
-1. Check your `claude_desktop_config.json` syntax (use JSON validator)
-2. Make sure private key starts with `0x`
-3. Restart Claude completely (quit and reopen)
+**Startup times out** — you set `HYPERLIQUID_PERP_DEXS="all"` somewhere. Unset it. Details in the README.
 
-### Issue: "Order value must be at least $10"
+**Old Python** — need 3.10+. `brew install python@3.11` / python.org / your distro's repo.
 
-**Fix:** Order too small
-- Calculate: size × price must be ≥ $10
-- For SOL at $200: need at least 0.05 SOL
-- For BTC at $50k: need at least 0.0002 BTC
+## Where to next
 
-### Issue: Python version too old
+- **Bracket orders** — "Long 2 SOL at 218, target 221, stop 216." Entry + TP + SL as one atomic exchange-side OCO: one side fills, the other auto-cancels. Wrong-side stop? Rejected locally before anything is signed. This is the tool that keeps a dead process from orphaning your stop — use it over naked entries.
+- **Market pressure** — "Any buy pressure on HYPE right now?" gets OBI, micro-price, and spread in a ~20-token payload.
+- **Risk** — "What's my 7-day downside on BTC?" runs a 10k-path Monte Carlo server-side and hands back VaR.
+- **Everything else** — [README.md](README.md) covers all thirty tools, agent mode for production keys, and the failure modes worth knowing.
 
-**Fix:** Update Python
-```bash
-# Check version
-python --version
+## Rules for real money
 
-# If < 3.10, install Python 3.11+
-# Windows: Download from python.org
-# Mac: brew install python@3.11
-# Linux: sudo apt install python3.11
-```
-
-## Next Steps
-
-Now that you're set up, try:
-
-1. **Read the full README.md** for all available tools
-2. **Check your positions:** "Show me my open positions"
-3. **View trade history:** "Show my trades from the past 24 hours"
-4. **Practice bracket orders:** "Place a bracket order for SOL..."
-
-## Safety Tips for Your First Trades
-
-1. ✅ **Start with testnet** until comfortable
-2. ✅ **Use small sizes** for first real trades
-3. ✅ **Always set stop losses** (use bracket orders)
-4. ✅ **Test cancellation** works before large orders
-5. ✅ **Monitor positions** regularly
-
-## Need Help?
-
-- **Full Documentation:** See README.md
-- **Hyperliquid Docs:** https://hyperliquid.gitbook.io/
-- **MCP Issues:** Open a GitHub issue
-- **Trading Support:** Hyperliquid Discord
-
-## Pro Tips
-
-### Use Natural Language
-
-Instead of memorizing commands, just talk naturally:
-
-```
-"What's my account worth?"
-"Show me the SOL order book"
-"Buy 0.1 BTC at market price with a stop loss 2% below"
-"Close all my positions"
-```
-
-Claude will figure out which tools to use!
-
-### Get Asset Indices Quickly
-
-```
-"What's the asset index for SOL?"
-```
-
-Claude will call `hyperliquid_get_meta` and tell you (it's 5).
-
-### Check Before You Trade
-
-```
-"Before I trade, show me:
-1. My current balance
-2. Current SOL price
-3. My open orders"
-```
-
-Claude will run all three checks!
-
----
-
-**You're all set! Happy trading! 🚀**
-
-Remember: Start small, use stop losses, and never risk more than you can afford to lose.
+1. Testnet until your process is boring.
+2. Agent mode on mainnet — API wallet signs, main key stays offline.
+3. Brackets, always. A position without a stop is a donation with extra steps.
+4. Small sizes first. Prove cancellation works before you scale.
+5. Markets don't care about you. Size accordingly.
