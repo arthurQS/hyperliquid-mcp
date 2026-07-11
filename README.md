@@ -164,10 +164,6 @@ Everything lives in `src/hyperliquid_mcp/server.py` — one class, two SDK clien
 
 PRs welcome. Bring tests; the math ones especially — a wrong number that parses is worse than a crash.
 
-## Community
-
-- [Telegram](https://t.me/+fC8GWO3zBe04NTY0) — strategies, help, war stories.
-
 ## Resources
 
 - [Hyperliquid docs](https://hyperliquid.gitbook.io/)
@@ -176,8 +172,8 @@ PRs welcome. Bring tests; the math ones especially — a wrong number that parse
 
 ## License
 
-MIT.
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Disclaimer
 
-This software that lets a language model sign orders against a perpetuals exchange with real leverage. It is provided as-is, it has edge cases, and markets do not care about you. Trade only what you can lose entirely. Nobody here is responsible for your P&L.
+This is software that lets a language model sign orders against a perpetuals exchange with real leverage. It is provided as-is, it has edge cases, and markets do not care about you. Trade only what you can lose entirely. Nobody here is responsible for your P&L.
