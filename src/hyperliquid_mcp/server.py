@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -1582,18 +1583,7 @@ class HyperliquidMCPServer:
         ]
         for param in integer_params:
             if param in arguments and arguments[param] is not None:
-                try:
-                    arguments[param] = int(float(arguments[param]))
-                    logger.debug(
-                        f"Normalized {param} parameter: {arguments[param]} (type: {type(arguments[param])})"
-                    )
-                except (ValueError, TypeError) as e:
-                    logger.error(
-                        f"Failed to convert {param} parameter to integer: {arguments.get(param)} - {e}"
-                    )
-                    raise ValueError(
-                        f"Invalid {param} parameter: {arguments.get(param)}. Must be a valid integer."
-                    )
+                arguments[param] = self._coerce_int(param, arguments[param])
 
         # Get user address (use configured account if not provided; `or` also
         # covers clients that send an explicit null)
@@ -1875,14 +1865,21 @@ class HyperliquidMCPServer:
                     "requestParams": arguments,
                 }
 
-            # Parse response for all three orders
-            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-            order_infos = []
-            for idx, status in enumerate(statuses):
-                order_type = ["entry", "take-profit", "stop-loss"][idx]
-                info = self._parse_order_status(status)
-                info["orderType"] = order_type
-                order_infos.append(info)
+            # Parse per-leg statuses: the exchange can return status "ok"
+            # with individual legs rejected, and an entry that fills with a
+            # rejected SL leg is an unprotected position — that must never
+            # read as "placed successfully".
+            order_infos, failed_legs = self._parse_bracket_result(result)
+            if failed_legs:
+                return {
+                    "message": "Bracket order partially failed",
+                    "error": "; ".join(
+                        f"{leg['orderType']}: {leg['error']}" for leg in failed_legs
+                    ),
+                    "data": result,
+                    "orders": order_infos,
+                    "requestParams": arguments,
+                }
 
             return {
                 "message": "Bracket order placed successfully",
@@ -1897,6 +1894,15 @@ class HyperliquidMCPServer:
 
             result = self.exchange.cancel(coin, oid)
 
+            summary = self._parse_cancel_result(result, [{"coin": coin, "oid": oid}])
+            if summary["failedCount"]:
+                return {
+                    "message": f"Cancel failed for order {oid} ({coin})",
+                    "error": summary.get("error", "unrecognized cancel status"),
+                    "data": result,
+                    "requestParams": arguments,
+                }
+
             return {
                 "message": f"Order {oid} cancelled for {coin}",
                 "data": result,
@@ -1906,8 +1912,10 @@ class HyperliquidMCPServer:
         elif name == "hyperliquid_cancel_all_orders":
             dex = arguments.get("dex", "")
 
-            # Get all open orders
-            open_orders = self.info.open_orders(user_address, dex=dex)
+            # frontend_open_orders (not open_orders) so untriggered TP/SL
+            # trigger orders are included — "cancel all" that leaves stale
+            # stops resting would fire them later against a flat book.
+            open_orders = self.info.frontend_open_orders(user_address, dex=dex)
 
             if not open_orders:
                 return {
@@ -1923,20 +1931,39 @@ class HyperliquidMCPServer:
 
             result = self.exchange.bulk_cancel(cancel_requests)
 
-            return {
-                "message": f"Cancelled {len(cancel_requests)} orders",
+            # An order can legitimately fill between the open-orders fetch and
+            # the cancel — report per-oid outcomes so the caller re-checks
+            # instead of assuming everything it saw is now gone.
+            summary = self._parse_cancel_result(result, cancel_requests)
+            response = {
+                "message": (
+                    f"Cancelled {summary['cancelledCount']} of "
+                    f"{len(cancel_requests)} orders"
+                ),
                 "data": result,
-                "cancelledCount": len(cancel_requests),
+                "cancelledCount": summary["cancelledCount"],
+                "failedCount": summary["failedCount"],
+                "outcomes": summary["outcomes"],
             }
+            if "error" in summary:
+                response["error"] = summary["error"]
+            return response
 
         elif name == "hyperliquid_modify_order":
             oid = arguments["oid"]  # Already normalized to integer
             coin = arguments["coin"]
             is_buy = arguments["isBuy"]
-            size = float(arguments["size"])
-            price = float(arguments["price"])
+            size = self._positive_float("size", arguments["size"])
+            price = self._positive_float("price", arguments["price"])
             reduce_only = arguments.get("reduceOnly", False)
             order_type = arguments.get("orderType", {"limit": {"tif": "Gtc"}})
+
+            # Same coercion as place_order: a string triggerPx would die deep
+            # in the SDK's float_to_wire with an opaque TypeError.
+            if "trigger" in order_type:
+                trigger = order_type["trigger"]
+                if "triggerPx" in trigger and isinstance(trigger["triggerPx"], str):
+                    trigger["triggerPx"] = float(trigger["triggerPx"])
 
             result = self.exchange.modify_order(
                 oid=oid,
@@ -1948,9 +1975,22 @@ class HyperliquidMCPServer:
                 reduce_only=reduce_only,
             )
 
+            # A rejected modify must never read as success: the caller may be
+            # "moving a stop" and would otherwise believe the position is
+            # protected at the new price.
+            order_info = self._parse_order_response(result)
+            if order_info["status"] == "error":
+                return {
+                    "message": f"Order {oid} modification failed",
+                    "error": order_info["error"],
+                    "data": result,
+                    "requestParams": arguments,
+                }
+
             return {
                 "message": f"Order {oid} modified successfully",
                 "data": result,
+                "orderInfo": order_info,
                 "modifiedOrder": {
                     "orderId": oid,
                     "coin": coin,
@@ -2495,6 +2535,46 @@ class HyperliquidMCPServer:
             raise ValueError(f"Unknown tool: {name}")
 
     @staticmethod
+    def _coerce_int(name: str, value: Any) -> int:
+        """Coerce a numeric argument to int, rejecting non-integral values.
+
+        Clients sometimes send integers as floats ("5.0"), which is fine —
+        but truncating a genuinely fractional value would silently target
+        the wrong thing (asset 5.7 -> the wrong instrument, oid 123.9 ->
+        the wrong order), so those raise instead.
+        """
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid {name} parameter: {value!r}. Must be a valid integer."
+            )
+        if not math.isfinite(f) or f != int(f):
+            raise ValueError(
+                f"Invalid {name} parameter: {value!r}. Must be a whole number."
+            )
+        return int(f)
+
+    @staticmethod
+    def _positive_float(name: str, value: Any) -> float:
+        """Coerce a size/price argument to a finite positive float.
+
+        This must run before anything reaches signing: the SDK's
+        float_to_wire guard (``abs(x) >= 1e-12``) is False for NaN, so a
+        "NaN" size would be signed and posted verbatim, and inf/negative
+        values likewise rely entirely on exchange-side rejection.
+        """
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid {name}: {value!r}. Must be a number.")
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(
+                f"Invalid {name}: {value!r}. Must be a finite positive number."
+            )
+        return v
+
+    @staticmethod
     def _top_level_error(result: Any) -> Optional[str]:
         """Extract a top-level API failure message, if any.
 
@@ -2527,6 +2607,67 @@ class HyperliquidMCPServer:
             result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
         )
         return self._parse_order_status(order_status)
+
+    def _parse_cancel_result(self, result: Any, requested: list) -> dict:
+        """Summarize a cancel/bulk_cancel response against the requested orders.
+
+        The exchange reports per-order outcomes in ``statuses`` — the string
+        ``"success"`` or ``{"error": "..."}`` (e.g. "Order was never placed,
+        already canceled, or filled.") — and can also fail top-level. A cancel
+        that silently failed leaves a live order the caller believes is gone,
+        so anything that isn't an explicit success is counted as failed.
+        """
+        err = self._top_level_error(result)
+        if err is not None:
+            return {
+                "cancelledCount": 0,
+                "failedCount": len(requested),
+                "error": err,
+                "outcomes": [
+                    {**req, "status": "error", "error": err} for req in requested
+                ],
+            }
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        outcomes = []
+        cancelled = 0
+        errors = []
+        for i, req in enumerate(requested):
+            status = statuses[i] if i < len(statuses) else None
+            if status == "success":
+                cancelled += 1
+                outcomes.append({**req, "status": "success"})
+            elif isinstance(status, dict) and "error" in status:
+                errors.append(f"oid {req.get('oid')}: {status['error']}")
+                outcomes.append({**req, "status": "error", "error": status["error"]})
+            else:
+                errors.append(f"oid {req.get('oid')}: unrecognized cancel status")
+                outcomes.append({**req, "status": "unknown", "rawStatus": status})
+        summary = {
+            "cancelledCount": cancelled,
+            "failedCount": len(requested) - cancelled,
+            "outcomes": outcomes,
+        }
+        if errors:
+            summary["error"] = "; ".join(errors)
+        return summary
+
+    def _parse_bracket_result(self, result: dict) -> tuple:
+        """Parse bulk_orders bracket statuses into (order_infos, failed_legs).
+
+        Statuses map positionally to the submitted order list (entry first).
+        The exchange can return status "ok" with per-leg {"error": ...}
+        entries, so each leg must be inspected — an entry that fills while
+        its SL leg was rejected is an unprotected position.
+        """
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        leg_names = ["entry", "take-profit", "stop-loss"]
+        order_infos = []
+        for idx, status in enumerate(statuses):
+            info = self._parse_order_status(status)
+            info["orderType"] = leg_names[idx] if idx < len(leg_names) else f"leg-{idx}"
+            order_infos.append(info)
+        failed_legs = [i for i in order_infos if i["status"] == "error"]
+        return order_infos, failed_legs
 
     def _parse_order_status(self, status: dict) -> dict:
         """Parse a single order status."""
