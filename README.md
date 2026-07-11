@@ -1,5 +1,7 @@
 # hyperliquid-mcp
 
+![hyperliquid-mcp in action](hl-mcp.gif)
+
 An MCP server that gives your AI/LLM direct, signed access to Hyperliquid perps. Built on the official Python SDK, hardened for the one failure mode that actually costs money: a rejected order reported as success. Every write parses the exchange response before it claims anything. Every read tells you where the data came from.
 
 You point Claude (or any MCP client) at it, hand it a key, and it trades.
