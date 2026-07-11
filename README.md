@@ -1,587 +1,183 @@
-# Hyperliquid MCP Server
+# hyperliquid-mcp
 
-A Model Context Protocol (MCP) server for Hyperliquid perpetual trading using the official Python SDK. This server provides AI assistants with secure, reliable access to Hyperliquid's trading platform.
+An MCP server that gives your AI direct, signed access to Hyperliquid perps. Built on the official Python SDK, hardened for the one failure mode that actually costs money: a rejected order reported as success. Every write parses the exchange response before it claims anything. Every read tells you where the data came from.
 
-## Features
+You point Claude (or any MCP client) at it, hand it a key, and it trades.
 
-✅ **Official SDK** - Built on the official Hyperliquid Python SDK with proper signing  
-✅ **Complete Coverage** - All trading endpoints: orders, positions, market data, vaults  
-✅ **Secure** - Proper EIP-712 signing with agent mode support  
-✅ **Bracket Orders** - Atomic entry + TP + SL with true exchange-side OCO (take-profit and stop-loss auto-cancel each other)  
-✅ **Market Data** - Real-time prices, order books, funding rates, candles  
-✅ **Live WebSocket State Engine** - In-memory order book mirror for instant, low-latency reads  
-✅ **Microstructure Signals** - Server-computed OBI, micro-price, and spread (bps) in a ~20-token payload  
-✅ **Trade-Flow Signals** - Server-computed CVD, aggressor volume, and trade-flow imbalance from the live trade tape  
-✅ **Technical Indicators** - Server-computed RSI, Bollinger Bands, EMA 9/21/50/200, and Volume SMA in one call, with deterministic derived flags  
-✅ **Monte Carlo Risk** - Vectorized GBM simulation (10k+ paths) returning VaR, terminal distribution, and probability of profit  
-✅ **Market Beta** - Server-computed beta, correlation, and R² of any asset against a benchmark (e.g. BTC) for risk-driver and position-sizing context  
-✅ **Account Management** - Positions, balances, fills, funding history  
-✅ **Leverage Control** - Set per-asset leverage and margin mode (cross/isolated) in one signed call  
-✅ **Testnet Support** - Test strategies safely before going live
-
-## Prerequisites
-
-- Python 3.10 or higher
-- [uv](https://github.com/astral-sh/uv) or [uvx](https://github.com/astral-sh/uv) for package management
-- A Hyperliquid account with deposited funds
-
-## Installation
-
-### Using uvx (Recommended)
+## Quick start
 
 ```bash
-# Install and run directly from PyPI
 uvx --from mcp-hyperliquid hyperliquid-mcp
 ```
 
-### Using pip
+That's it. No `.env` file, no config directory — everything comes from your MCP client's `env` block:
 
-```bash
-# Install with pip
-pip install mcp-hyperliquid
-
-# Run
-mcp-hyperliquid
+```json
+{
+  "mcpServers": {
+    "hyperliquid": {
+      "command": "uvx",
+      "args": ["--from", "mcp-hyperliquid", "hyperliquid-mcp"],
+      "env": {
+        "HYPERLIQUID_PRIVATE_KEY": "0x...",
+        "HYPERLIQUID_TESTNET": "true"
+      }
+    }
+  }
+}
 ```
 
-### Local Development
+Yes, `"true"`. Start on testnet. Flip it to `"false"` after your strategy survives fake money.
+
+Running from source instead:
 
 ```bash
-# Clone and install from source
 git clone https://github.com/Dakkshin/hyperliquid-mcp.git
 cd hyperliquid-mcp
 uv sync
-
-# Run locally
 uv run python -m hyperliquid_mcp.server
 ```
 
-#### Local Development Configuration
+(Same client config, but `command: "uv"`, `args: ["--directory", "/path/to/hyperliquid-mcp", "run", "python", "-m", "hyperliquid_mcp.server"]`.)
 
-If you're running from source code locally, use this configuration:
+## Before it will trade
+
+Hyperliquid doesn't know your wallet until it holds funds. One-time setup:
+
+- **Mainnet:** connect at https://app.hyperliquid.xyz, deposit anything from Arbitrum. Deposit = registration.
+- **Testnet:** connect at https://app.hyperliquid-testnet.xyz, hit the faucet.
+
+Skip this and every write comes back `User or API Wallet does not exist`. The server will hand you that exact message instead of a stack trace — but it can't deposit for you.
+
+## Pick your setup
+
+**Just exploring / paper trading.** `HYPERLIQUID_TESTNET=true`, your wallet key, done. Testnet is a full parallel universe: separate ledger, separate agent approvals, and — this bites everyone — **separate asset indices**. BTC is index 0 on mainnet and 3 on testnet. Never hardcode an index; resolve through `hyperliquid_get_meta` every time.
+
+**Running real money.** Use agent mode. Generate an API wallet in the Hyperliquid UI (More -> API), approve it from your main account, then:
 
 ```json
-{
-  "mcpServers": {
-    "hyperliquid": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/path/to/hyperliquid-mcp",
-        "run",
-        "python",
-        "-m",
-        "hyperliquid_mcp.server"
-      ],
-      "env": {
-        "HYPERLIQUID_PRIVATE_KEY": "0x1234567890abcdef...",
-        "HYPERLIQUID_TESTNET": "false"
-      }
-    }
-  }
+"env": {
+  "HYPERLIQUID_PRIVATE_KEY": "0xApiWalletKey...",
+  "HYPERLIQUID_ACCOUNT_ADDRESS": "0xYourMainAccount...",
+  "HYPERLIQUID_TESTNET": "false"
 }
 ```
 
-Replace `/path/to/hyperliquid-mcp` with the actual path to your cloned repository.
+The API wallet signs; your main key never touches the machine running the model. This is the only sane production configuration. Agent approvals are per-network — a mainnet-approved agent is a stranger on testnet.
 
-## Configuration
+**Trading builder-dex perps (equities, gold, HIP-3 stuff).** Set `HYPERLIQUID_PERP_DEXS="xyz"` (comma-separated for several). Unset means primary dex only — ~2s startup, covers every standard perp. `"all"` loads every discovered dex: hundreds of serial REST calls, ~90s, and your MCP client kills the connection at 30s unless you raise `MCP_TIMEOUT=180000`. You almost certainly don't want `"all"`.
 
-### 1. Register Your Wallet on Hyperliquid
+Optional: `HYPERLIQUID_VAULT_ADDRESS` if you trade a vault.
 
-**IMPORTANT:** Your wallet must be registered on Hyperliquid before trading.
+## What it does
 
-**Mainnet:**
+Thirty tools. The interesting ones:
 
-1. Go to https://app.hyperliquid.xyz
-2. Connect your wallet
-3. Deposit funds from Arbitrum One (any amount registers your wallet)
+**Execution.** `place_order`, `place_bracket_order`, `modify_order`, `cancel_order`, `cancel_all_orders`, `update_leverage`. Market orders are emulated the way the SDK does it — aggressive IoC limit at mid ±5% — because Hyperliquid has no native market order and a resting buy at $0 would just sit there forever.
 
-**Testnet:**
+**Brackets are real OCO.** Entry + TP + SL ship as one atomic `normalTpsl` group. TP and SL are children of the entry: one fills, the exchange kills the other; cancel the entry, both die. No stale stop left resting on the book at 3am. The stop-loss triggers as *market* with a slippage-bounded limit — a limit stop can gap straight through its price and never fill, which defeats the entire point of a stop.
 
-1. Go to https://app.hyperliquid-testnet.xyz
-2. Connect your wallet
-3. Get testnet funds from the faucet or bridge
+**The server refuses garbage before signing it.** Wrong-side stop on a long (SL above entry)? Rejected locally — it would trigger the instant it hit the book. `size: "NaN"`? Rejected — the SDK's wire encoder would happily sign it otherwise. `asset: 5.7`? Rejected, not truncated to 5 — silent truncation means ordering the wrong instrument.
 
-### 2. Configure Your MCP Client
+**And it never lies about outcomes.** A rejected cancel says `Cancel failed` with the exchange's reason. A bracket with an invalid leg reports the atomic group rejection. `cancel_all_orders` returns per-oid outcomes and an honest count — including the untriggered TP/SL stops, which the naive open-orders endpoint doesn't even list. If a write *times out*, the response says "may still have executed, recheck" — because a timeout after the request left the building is not a failure, and treating it as one is how you double-fill.
 
-Environment variables are now configured directly in your MCP client settings (no `.env` file needed).
+**Market data with a freshness receipt.** Order books, trades, candles, funding, open interest. Hot reads are served from a live in-memory WebSocket mirror — O(1), no REST round-trip — and every response carries `source: "websocket"` or `"rest"` so you know exactly what you got. The SDK's socket doesn't auto-reconnect; when it dies, reads silently degrade to REST instead of serving you a stale book. Slower, never wrong.
 
-#### Claude Desktop / Kiro
+**Server-side quant, token-sized payloads.** The whole point of computing on the server: an 8B model shouldn't be doing float comparisons, and you shouldn't pay tokens for 1000 raw book levels.
 
-Add to your `mcp.json` configuration file:
+- `get_microstructure` — OBI, Stoikov micro-price, spread in bps. ~20 tokens.
+- `get_orderflow` — CVD, aggressor buy/sell volume, trade-flow imbalance off the live tape. Book says intent, tape says action; read both.
+- `get_indicators` — RSI (Wilder's, pinned by tests against Cutler's), Bollinger (population std, also pinned), EMA 9/21/50/200, volume SMA. One call, one interval. Returns raw values plus *deterministic* flags — `rsi.zone`, `ema.is_ordered_up`, `bollinger.is_squeeze`. Mathematical facts only. It will never tell you `signal: "BUY"`; forming opinions is your model's job.
+- `run_monte_carlo` — vectorized GBM, 10k+ paths, returns VaR, terminal percentiles, probability of profit. Samples terminal prices directly (one draw per path, O(iterations) whatever the horizon). Default drift is martingale — zero expected return — because 30 days of history is a vibe, not a drift estimate. Check `observations` in the output: the candle API caps around 5000 rows, so a 30-day lookback at 1m candles is quietly ~3.5 days of data. The field exists so you can catch it.
+- `get_beta` — beta, correlation, R² against a benchmark you must name (no sneaky default). Timestamp-aligned log-return regression. No alpha, no flags — beta is a continuous sizing input, and a `beta > 1` boolean would invent a cliff that doesn't exist.
 
-```json
-{
-  "mcpServers": {
-    "hyperliquid": {
-      "command": "uvx",
-      "args": ["--from", "mcp-hyperliquid", "hyperliquid-mcp"],
-      "env": {
-        "HYPERLIQUID_PRIVATE_KEY": "0x1234567890abcdef...",
-        "HYPERLIQUID_TESTNET": "false"
-      }
-    }
-  }
-}
-```
+**Not implemented:** `place_twap_order` / `cancel_twap_order` are schema stubs that raise. They're declared so clients can see them coming; they don't work yet. ¯\\_(ツ)_/¯
 
-**Required Environment Variables:**
+## Talking to it
 
-- `HYPERLIQUID_PRIVATE_KEY` - Your wallet's private key for signing transactions
-
-**Optional Environment Variables:**
-
-- `HYPERLIQUID_ACCOUNT_ADDRESS` - For agent/API wallet mode (advanced)
-- `HYPERLIQUID_TESTNET` - Set to "true" for testnet, "false" or omit for mainnet
-- `HYPERLIQUID_VAULT_ADDRESS` - For vault trading
-- `HYPERLIQUID_PERP_DEXS` - Which builder (HIP-3) perp dexes to preload. Omit for the **primary dex only** (fast ~2s startup, covers all standard perps like BTC/ETH/SOL). Set to a comma-separated list (e.g. `"xyz,abc"`) to also load specific builder dexes for equity/commodity perps, or `"all"` to load every dex (slow — the network exposes hundreds; requires raising your client's MCP startup timeout, e.g. `MCP_TIMEOUT=180000`)
-
-#### Full Configuration Example
-
-```json
-{
-  "mcpServers": {
-    "hyperliquid": {
-      "command": "uvx",
-      "args": ["--from", "mcp-hyperliquid", "hyperliquid-mcp"],
-      "env": {
-        "HYPERLIQUID_PRIVATE_KEY": "0x1234567890abcdef...",
-        "HYPERLIQUID_ACCOUNT_ADDRESS": "0xYourTradingAccountAddress...",
-        "HYPERLIQUID_TESTNET": "false",
-        "HYPERLIQUID_VAULT_ADDRESS": "0xVaultAddress..."
-      }
-    }
-  }
-}
-```
-
-#### Other MCP Clients
-
-Configure according to your client's documentation, using:
-
-- **Command:** `uvx` or `python`
-- **Args:** `["--from", "mcp-hyperliquid", "hyperliquid-mcp"]` or `["-m", "hyperliquid_mcp.server"]`
-- **Environment:** Add the required environment variables in your client's env configuration
-
-## Available Tools
-
-### Account & Position Management
-
-- **`hyperliquid_get_account_info`** - Get complete account summary
-- **`hyperliquid_get_positions`** - Get all open positions
-- **`hyperliquid_get_balance`** - Get balance across **both** the perp and spot accounts (perp margin/withdrawable + spot USDC/holdings)
-- **`hyperliquid_update_leverage`** - Set an asset's leverage multiplier **and** margin mode in one call (`isCross` true = cross, false = isolated); rejected exchange-side if above the asset's max leverage
-
-### Order Management
-
-- **`hyperliquid_place_order`** - Place a single order
-- **`hyperliquid_place_bracket_order`** - Place entry + TP + SL atomically
-- **`hyperliquid_cancel_order`** - Cancel a specific order
-- **`hyperliquid_cancel_all_orders`** - Cancel all open orders
-- **`hyperliquid_modify_order`** - Modify an existing order
-- **`hyperliquid_place_twap_order`** - Place TWAP order (coming soon)
-- **`hyperliquid_cancel_twap_order`** - Cancel TWAP order (coming soon)
-
-### Order Queries
-
-- **`hyperliquid_get_open_orders`** - Get all open orders
-- **`hyperliquid_get_order_status`** - Get status of specific order
-- **`hyperliquid_get_user_fills`** - Get trade fill history
-- **`hyperliquid_get_user_funding`** - Get funding payment history
-
-### Market Data
-
-- **`hyperliquid_get_meta`** - Get exchange metadata (assets, leverage, etc.)
-- **`hyperliquid_get_all_mids`** - Get current mid prices for all assets
-- **`hyperliquid_get_open_interest`** - Get open interest (base + USD notional) plus funding/mark price/volume for one asset or all assets on a dex
-- **`hyperliquid_get_order_book`** - Get order book depth (top `depth` levels per side, default 5; served from a live WebSocket mirror)
-- **`hyperliquid_get_microstructure`** - Get dense edge-level signals (OBI, micro-price, spread in bps) computed server-side
-- **`hyperliquid_get_orderflow`** - Get dense trade-flow signals (CVD, aggressor buy/sell volume, trade-flow imbalance) over a recent window, computed server-side
-- **`hyperliquid_get_recent_trades`** - Get recent trades
-- **`hyperliquid_get_historical_funding`** - Get funding rate history
-- **`hyperliquid_get_candles`** - Get OHLCV candle data
-- **`hyperliquid_get_indicators`** - Compute the classic discretionary indicator bundle (RSI, Bollinger Bands, EMA 9/21/50/200, Volume SMA) server-side in one call, returning raw values plus deterministic derived flags (RSI zone, price-vs-EMA, price-vs-bands, EMA ordering) - single interval per call
-
-### Risk & Quant
-
-- **`hyperliquid_run_monte_carlo`** - Run a vectorized GBM Monte Carlo price simulation and return an aggregated risk profile (VaR, terminal-price distribution, probability of profit), computed server-side
-- **`hyperliquid_get_beta`** - Compute an asset's market beta against a benchmark (required, e.g. `BTC`) from a single log-return regression over timestamp-aligned candles - returns beta, correlation, R², and per-step volatilities (descriptive coupling facts, no trading opinions)
-
-### Vault Management
-
-- **`hyperliquid_vault_details`** - Get vault details
-- **`hyperliquid_vault_performance`** - Get vault performance metrics
-
-### Utility
-
-- **`hyperliquid_get_server_time`** - Get server timestamp
-
-## Usage Examples
-
-### Example 1: Check Account Balance
+You don't call these tools — your model does. Prompts that work:
 
 ```
-Show me my Hyperliquid account balance
+Show me my Hyperliquid balance
 ```
 
-The AI will call `hyperliquid_get_balance`, which queries **both** ledgers Hyperliquid keeps per user, and show you:
-
-- **Perp account** — account value, margin used, withdrawable/available balance
-- **Spot account** — USDC balance and any non-zero spot holdings
-- **`totalUsdcAcrossAccounts`** — combined USDC across perp + spot (a wallet holding only spot USDC reports a $0 perp balance, so both are surfaced)
-
-### Example 2: Get Market Data
+Returns both ledgers — perp *and* spot. Hyperliquid keeps them separate, and a wallet holding only spot USDC reports a $0 perp balance. Learned that one the annoying way; the tool now surfaces `totalUsdcAcrossAccounts` so nobody else has to.
 
 ```
-What's the current price of SOL on Hyperliquid? Show me the order book too.
+Is there buy or sell pressure on HYPE right now?
 ```
 
-The AI will:
-
-1. Call `hyperliquid_get_meta` to find SOL's index
-2. Call `hyperliquid_get_all_mids` for current price
-3. Call `hyperliquid_get_order_book` for depth
-
-By default `hyperliquid_get_order_book` returns the top **5** levels per side (pass `depth` for more). The book is served instantly from a live WebSocket mirror when fresh, and each response carries a `source` field (`"websocket"` or `"rest"`) so you know how fresh it is.
-
-### Example 3: Gauge Market Pressure (Microstructure)
-
-```
-Is there buy or sell pressure on HYPE right now, and how tight is the spread?
-```
-
-The AI calls `hyperliquid_get_microstructure` and gets back a dense signal computed server-side (no raw book parsing needed):
+One `get_microstructure` call:
 
 ```json
 {"asset":"HYPE","source":"websocket","depth":5,"OBI":0.62,"micro_price":1.452,"mid":1.451,"spread_bps":2.1}
 ```
 
-- **`OBI`** (Order Book Imbalance) — bid share of top-`depth` volume; `>0.5` means bids are heavier (upward pressure).
-- **`micro_price`** — Stoikov fair value that reacts faster than the plain mid.
-- **`spread_bps`** — bid-ask spread in basis points (tightening ≈ liquid/imminent move, widening ≈ thin).
-
-This is far cheaper on tokens than fetching the raw order book — prefer it when you only need to read market pressure rather than inspect individual levels.
-
-### Example 4: Read Trade Flow (Order Flow / CVD)
+OBI 0.62 = bids carrying 62% of top-of-book volume. Micro-price above mid = pressure pointing up. Spread ~2bps = liquid.
 
 ```
-Over the last minute, is BTC seeing net buying or selling on Hyperliquid?
+Long 4.12 SOL, entry 218, target 219.50, stop 216.80
 ```
 
-The AI calls `hyperliquid_get_orderflow` (optionally with `window_secs`, default 60) and gets a dense signal computed server-side from the executed-trade tape:
-
-```json
-{"asset":"BTC","source":"websocket","window_secs":60,"buy_vol":12.34,"sell_vol":9.87,"CVD":2.47,"TFI":0.111,"trades":143,"vwap":61234.5,"last_px":61240.0,"duration_s":59.8}
-```
-
-- **`buy_vol` / `sell_vol`** — aggressor-signed volume (`"B"` = buy aggressor, `"A"` = sell aggressor).
-- **`CVD`** — cumulative volume delta over the window (`buy_vol − sell_vol`); positive = net buying.
-- **`TFI`** — trade-flow imbalance in `[-1, 1]` (0 = balanced); the flow analog of OBI.
-- **`vwap` / `last_px` / `trades` / `duration_s`** — window VWAP, last print, trade count, and actual span covered.
-
-Where `get_microstructure` reads the *resting book*, `get_orderflow` reads *executed flow* — use them together to see both intent and action.
-
-### Example 5: Simulate Downside Risk (Monte Carlo)
+Model resolves SOL's index via `get_meta`, fires `place_bracket_order`, gets back three legs with statuses. If it had asked for a stop above entry, the order never leaves the machine.
 
 ```
-If I hold BTC for the next 7 days, what's my downside risk?
+If I hold BTC for 7 days, what's my downside?
 ```
 
-The AI calls `hyperliquid_run_monte_carlo` (defaults: `1h` candles, `lookback_days=30`, `days_forward=7`, `iterations=10000`). The server estimates volatility from recent candles, runs the paths through a vectorized Geometric Brownian Motion model in numpy, and returns only the aggregated risk profile:
+`run_monte_carlo` -> `VaR_5pct: 0.0836` = 8.4% loss at the 5th percentile. Ten thousand simulated paths, none of which cross the wire — only the summary does.
 
-```json
-{"asset":"BTC","interval":"1h","days_forward":7,"lookback_days":30,"drift":"zero","s0":61240.0,"steps":168,"iterations":10000,"sigma_per_step":0.0031,"mu_per_step":0.0,"mean_terminal":61230.4,"median_terminal":61180.2,"p05_terminal":56120.7,"p95_terminal":66540.9,"expected_return":-0.0002,"VaR_5pct":0.0836,"prob_profit":0.497}
-```
+## When it breaks
 
-- **`VaR_5pct`** — 5% Value at Risk as a positive loss magnitude (here ≈ 8.4% worst-case over the horizon at the 5th percentile).
-- **`p05_terminal` / `median_terminal` / `p95_terminal`** — terminal-price percentiles bracketing the outcome distribution.
-- **`prob_profit`** — share of paths ending above the current price.
-- **`drift`** — `"zero"` by default (conservative for risk); pass `use_historical_drift=true` to use the historical mean return as drift.
+**`User or API Wallet does not exist`** — wallet not registered on *this* network, or agent not approved on *this* network. Deposit/faucet first; approve agents per-network.
 
-Only the summary crosses the wire — the thousands of simulated paths never leave the server, so it stays cheap on tokens while doing the heavy compute in Python.
+**`Order has invalid price.` / `Order has invalid size.`** — tick and lot rules. Prices: max 5 significant figures and per-asset decimal limits. Sizes: `szDecimals` from `get_meta`. And `size × price ≥ $10`, always.
 
-### Example 6: Read Technical Indicators (RSI, Bollinger, EMAs, Volume)
+**Connection times out at startup** — you set `HYPERLIQUID_PERP_DEXS="all"`. Unset it, or raise `MCP_TIMEOUT`. This is a startup-speed problem, not a config error.
 
-```
-Give me the technical picture for BTC on the 1h — RSI, Bollinger, the EMA stack, and volume.
-```
+**Every read says `source: "rest"`** — the WebSocket died (it doesn't reconnect) or hasn't warmed up yet. First read on a coin is always REST; the mirror takes over within a couple of seconds. Persistent REST means restart the server. Data stays correct either way — that's the fallback doing its job.
 
-The AI calls `hyperliquid_get_indicators` (defaults: `interval="1h"`, `rsi_period=14`, `bb_period=20`, `bb_stddev=2`, `vol_sma_period=20`). The server fetches recent candles and computes the whole bundle at once, returning raw values paired with deterministic flags:
-
-```json
-{"asset":"BTC","interval":"1h","candles":601,"price":63240.0,"rsi":{"value":68.71,"period":14,"zone":"NEUTRAL","is_overbought":false,"is_oversold":false},"bollinger":{"period":20,"stddev":2.0,"upper":63297.8,"middle":62726.05,"lower":62154.3,"percent_b":0.949,"bandwidth":0.0182,"price_vs_bands":"INSIDE","is_squeeze":false},"ema":{"is_ordered_up":true,"is_ordered_down":false,"9":{"value":63017.88,"price_is_above":true},"21":{"value":62761.18,"price_is_above":true},"50":{"value":62231.9,"price_is_above":true},"200":{"value":61200.51,"price_is_above":true}},"volume":{"period":20,"current":1055.39,"sma":789.83,"ratio":1.336,"above_sma":true}}
-```
-
-- **`rsi`** — value plus `zone` (`OVERBOUGHT` >70 / `OVERSOLD` <30 / `NEUTRAL`) and boolean flags.
-- **`bollinger`** — `upper`/`middle`/`lower` bands, `percent_b`, `bandwidth`, `price_vs_bands` (`ABOVE_UPPER`/`INSIDE`/`BELOW_LOWER`), and `is_squeeze` (bandwidth at its trailing minimum).
-- **`ema`** — each of 9/21/50/200 with `price_is_above`, plus `is_ordered_up`/`is_ordered_down` (pure 9>21>50>200 ordering — a fact, not a call).
-- **`volume`** — latest volume vs its SMA (`ratio`, `above_sma`).
-
-Every flag is a **deterministic mathematical fact** (never a `BUY`/`BULLISH` opinion), so a downstream model can branch on booleans instead of doing float math. It's **single interval per call** — ask for `1h` and `1d` in two calls for multi-timeframe context. An indicator whose window exceeds the available history (e.g. EMA200 on a young asset) returns a `null` value rather than failing the call.
-
-### Example 7: Place a Bracket Order
-
-```
-Place a bracket order on Hyperliquid:
-- Pair: SOL-USD
-- Side: BUY (LONG)
-- Size: 4.12 SOL (~$900)
-- Entry: $218.00
-- Target: $219.50 (+0.7%)
-- Stop Loss: $216.80 (-0.8%)
-```
-
-The AI will:
-
-1. Call `hyperliquid_get_meta` to get SOL's asset index (5)
-2. Call `hyperliquid_place_bracket_order` with:
-   - asset: 5
-   - isBuy: true
-   - size: "4.12"
-   - entryPrice: "218.00"
-   - takeProfitPrice: "219.50"
-   - stopLossPrice: "216.80"
-
-This places 3 orders atomically as a true **OCO bracket** (`normalTpsl` grouping):
-
-- Entry order at $218.00 (the parent)
-- Take profit trigger at $219.50 (reduce-only)
-- Stop loss trigger at $216.80 (reduce-only, market-triggered)
-
-Because the TP and SL are children of the entry, they are a real One-Cancels-the-Other pair on the exchange: when one fills the other is **auto-cancelled**, and cancelling the entry cancels both — no stale resting stop is ever left behind.
-
-### Example 8: Check Positions and Close
-
-```
-Show me my open positions. If I have a SOL position, close it at market price.
-```
-
-The AI will:
-
-1. Call `hyperliquid_get_positions`
-2. If SOL position exists, call `hyperliquid_place_order` with:
-   - Opposite side (sell if long, buy if short)
-   - Market order (price = "0")
-   - Reduce-only enabled
-
-### Example 9: View Recent Trading Activity
-
-```
-Show me my last 50 trades from the past 24 hours
-```
-
-The AI will:
-
-1. Calculate timestamps (now - 24h to now)
-2. Call `hyperliquid_get_user_fills` with time range
-3. Format and display the results
-
-## Asset Index Reference
-
-Use `hyperliquid_get_meta` to get the full list. Common assets:
-
-| Index | Asset | Index | Asset | Index | Asset |
-| ----- | ----- | ----- | ----- | ----- | ----- |
-| 0     | BTC   | 1     | ETH   | 5     | SOL   |
-| 10    | LTC   | 11    | ARB   | 14    | SUI   |
-| 18    | LINK  | 25    | XRP   | 27    | APT   |
-
-## Order Types
-
-### Limit Order (Good-Till-Cancel)
-
-```python
-order_type = {"limit": {"tif": "Gtc"}}
-```
-
-### Market Order (Immediate or Cancel)
-
-```python
-price = "0"  # Setting price to 0 makes it a market order
-order_type = {"limit": {"tif": "Ioc"}}
-```
-
-### Trigger Order (Stop Loss / Take Profit)
-
-```python
-order_type = {
-    "trigger": {
-        "triggerPx": "100.5",  # Trigger price
-        "isMarket": False,      # False for limit, True for market
-        "tpsl": "tp"            # "tp" for take profit, "sl" for stop loss
-    }
-}
-```
-
-## Error Handling
-
-### "User or API Wallet does not exist"
-
-**Problem:** Your wallet isn't registered on Hyperliquid.
-
-**Solution:**
-
-1. Go to app.hyperliquid.xyz (or testnet URL)
-2. Connect your wallet
-3. Deposit any amount from Arbitrum
-4. This registers your wallet
-
-### "Order value must be at least $10"
-
-**Problem:** Your order size is too small.
-
-**Solution:** Ensure `size * price >= $10`
-
-Example:
-
-- SOL at $200: Need at least 0.05 SOL
-- BTC at $50,000: Need at least 0.0002 BTC
-
-### "Invalid signature"
-
-**Problem:** Private key mismatch or signing error.
-
-**Solution:**
-
-1. Check your HYPERLIQUID_PRIVATE_KEY is correct
-2. Ensure it matches the wallet address you registered
-3. If using agent mode, verify HYPERLIQUID_ACCOUNT_ADDRESS
-
-## Agent Mode (Advanced)
-
-Agent mode allows an API wallet to sign transactions for a different trading account.
-
-**Use case:** Keep your main account safe while allowing an API wallet to trade.
-
-**Setup:**
+**Debugging anything else:**
 
 ```bash
-HYPERLIQUID_PRIVATE_KEY=0xApiWalletPrivateKey...
-HYPERLIQUID_ACCOUNT_ADDRESS=0xMainTradingAccountAddress...
-```
-
-**Requirements:**
-
-1. Both wallets must be registered on Hyperliquid
-2. Main account must approve the API wallet as an agent
-3. Use `approve_agent` action through Hyperliquid UI first
-
-## Security Best Practices
-
-1. **Never commit private keys** - Always use environment variables
-2. **Use testnet first** - Test strategies before going live
-3. **Set up stop losses** - Use bracket orders for risk management
-4. **Monitor positions** - Regularly check your account
-5. **Use agent mode** - For production, keep main account key offline
-6. **Start small** - Test with minimum order sizes first
-
-## Troubleshooting
-
-### Server won't start
-
-```bash
-# Check Python version
-python --version  # Should be 3.10+
-
-# Check dependencies
-uv sync
-
-# Environment variables come from your MCP client's `env` block (not a .env file) —
-# make sure HYPERLIQUID_PRIVATE_KEY is set there
-
-# Run with debug logging
 HYPERLIQUID_LOG_LEVEL=DEBUG uvx --from mcp-hyperliquid hyperliquid-mcp
 ```
 
-### MCP connection times out on startup (`connection timed out after 30000ms`)
+## Security, bluntly
 
-This is a **startup-speed** problem, not a config error. If you set `HYPERLIQUID_PERP_DEXS="all"`, the server loads every perp dex's universe (the network exposes hundreds — ~90s on testnet), which exceeds your MCP client's default 30s connect timeout. Fixes:
-
-1. **Recommended:** leave `HYPERLIQUID_PERP_DEXS` unset (loads the primary dex only, ~2s startup). All standard perps (BTC/ETH/SOL/etc.) still resolve.
-2. If you genuinely need every builder dex, raise the client timeout, e.g. `MCP_TIMEOUT=180000` when launching your MCP client.
-
-### Orders not placing
-
-1. Check wallet is registered (see error handling)
-2. Verify order size meets $10 minimum
-3. Check you have sufficient balance
-4. Ensure asset index is correct (use `get_meta`)
-
-### Can't find asset
-
-```
-Use the hyperliquid_get_meta tool to get all asset indices
-```
-
-The AI will show you the complete list of tradeable assets with their indices.
+1. The key in your MCP config can sign orders. Treat that file like the key itself.
+2. Agent mode for anything real. Main key stays offline.
+3. Testnet first. The parallel universe is free.
+4. Brackets over naked entries. The exchange-side OCO exists so a dead process can't orphan your stop.
+5. The server never logs or echoes the private key. It also can't stop you from pasting it into a chat. Don't.
 
 ## Development
 
-### Local Development
-
 ```bash
-# Clone the repository
-git clone https://github.com/Dakkshin/hyperliquid-mcp.git
-cd hyperliquid-mcp
-
-# Install dependencies
 uv sync
-
-# Run locally
-uv run python -m hyperliquid_mcp.server
-
-# Run tests (when available)
-uv run pytest
+uv run pytest        # ~100 tests: golden-value math pins, response-parsing fixtures, liveness guards
+uv run black src/
+uv run mypy src/
 ```
 
-### Code Structure
+Everything lives in `src/hyperliquid_mcp/server.py` — one class, two SDK clients, a dispatch table, and a threaded WebSocket state engine. The tests are the contract: Wilder RSI vs Cutler's, Bollinger `ddof=0` vs `ddof=1`, martingale drift, OCO status parsing — swap a formula and the suite fails loudly, which is the entire point.
 
-```
-hyperliquid-mcp/
-├── src/
-│   └── hyperliquid_mcp/
-│       ├── __init__.py
-│       └── server.py          # Main MCP server implementation
-├── pyproject.toml             # Project configuration
-├── README.md                  # This file
-└── .env.example              # Environment template
-```
+PRs welcome. Bring tests; the math ones especially — a wrong number that parses is worse than a crash.
 
-### **Join Our Community**
+## Community
 
-- **[Telegram Group](https://t.me/+fC8GWO3zBe04NTY0)** - Get help, share strategies, and connect with other traders
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## License
-
-MIT License - see LICENSE file for details
+- [Telegram](https://t.me/+fC8GWO3zBe04NTY0) — strategies, help, war stories.
 
 ## Resources
 
-- [Hyperliquid Official Docs](https://hyperliquid.gitbook.io/)
-- [Hyperliquid Python SDK](https://github.com/hyperliquid-dex/hyperliquid-python-sdk)
+- [Hyperliquid docs](https://hyperliquid.gitbook.io/)
+- [hyperliquid-python-sdk](https://github.com/hyperliquid-dex/hyperliquid-python-sdk)
 - [Model Context Protocol](https://modelcontextprotocol.io/)
-- [MCP Servers Repository](https://github.com/modelcontextprotocol/servers)
 
-## Support
+## License
 
-- **Issues:** Open an issue on GitHub
-- **Hyperliquid Support:** https://hyperliquid.gitbook.io/hyperliquid-docs/help/support
-- **MCP Documentation:** https://modelcontextprotocol.io/
+MIT.
 
 ## Disclaimer
 
-This software is provided "as is" without warranty. Trading cryptocurrencies carries significant risk. Only trade with funds you can afford to lose. The authors are not responsible for any trading losses.
-
----
-
-**Happy Trading! 🚀**
+This is software that lets a language model sign orders against a perpetuals exchange with real leverage. It is provided as-is, it has edge cases, and markets do not care about you. Trade only what you can lose entirely. Nobody here is responsible for your P&L.
