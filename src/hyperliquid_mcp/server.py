@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 import eth_account
 import numpy as np
+import requests
 from eth_account.signers.local import LocalAccount
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
@@ -35,6 +36,27 @@ logger = logging.getLogger(__name__)
 
 # Environment variables are now loaded from client config (MCP settings)
 # No need for dotenv - variables come from the env section in mcp.json
+
+# Finite timeout for every SDK REST call. The SDK defaults to timeout=None,
+# which requests treats as wait-forever — one hung connection would pin an
+# executor thread for the life of the process, and a few of them starve the
+# to_thread pool and hang the whole server mid-trade. Caveat for write calls:
+# a timeout does NOT mean the order failed — it may have executed after the
+# request was sent; recheck order status before retrying (see call_tool).
+HTTP_TIMEOUT_SECS = 10.0
+
+# Tools that sign and submit state-changing actions. A timeout on one of
+# these must not be read as "the action failed" — see call_tool.
+WRITE_TOOLS = frozenset(
+    {
+        "hyperliquid_place_order",
+        "hyperliquid_place_bracket_order",
+        "hyperliquid_modify_order",
+        "hyperliquid_cancel_order",
+        "hyperliquid_cancel_all_orders",
+        "hyperliquid_update_leverage",
+    }
+)
 
 
 class HyperliquidMCPServer:
@@ -125,7 +147,7 @@ class HyperliquidMCPServer:
             #   "a,b,c"     -> primary dex plus the named dexes
             cfg = self.perp_dexs_config.lower()
             if cfg == "all":
-                bootstrap_info = Info(base_url, skip_ws=True)
+                bootstrap_info = Info(base_url, skip_ws=True, timeout=HTTP_TIMEOUT_SECS)
                 perp_dex_list = bootstrap_info.perp_dexs()
                 dex_names = [""] + [d["name"] for d in perp_dex_list[1:] if d]
             elif self.perp_dexs_config:
@@ -140,7 +162,12 @@ class HyperliquidMCPServer:
             # Initialize Info (read-only queries) with all perp dex universes
             # loaded. skip_ws=False starts the SDK's background WebSocket manager
             # (thread-based) so we can subscribe to live l2Book / userFills streams.
-            self.info = Info(base_url, skip_ws=False, perp_dexs=dex_names)
+            self.info = Info(
+                base_url,
+                skip_ws=False,
+                perp_dexs=dex_names,
+                timeout=HTTP_TIMEOUT_SECS,
+            )
 
             # Reverse map for asset-index -> coin-name resolution across all
             # dexes (default dex indices 0..N, builder dexes offset by
@@ -158,6 +185,7 @@ class HyperliquidMCPServer:
                 account_address=self.account_address,
                 vault_address=self.vault_address,
                 perp_dexs=dex_names,
+                timeout=HTTP_TIMEOUT_SECS,
             )
 
             # Verify wallet is registered
@@ -174,6 +202,15 @@ class HyperliquidMCPServer:
 
         except Exception as e:
             logger.error(f"Failed to initialize Hyperliquid SDK: {e}")
+            # Info(skip_ws=False) starts NON-daemon WS + ping threads; if we
+            # re-raise without stopping them, sys.exit(1) in main() blocks
+            # joining them and the "failed" process hangs as a zombie.
+            info = getattr(self, "info", None)
+            if info is not None:
+                try:
+                    info.disconnect_websocket()
+                except Exception:
+                    pass
             raise
 
     # ------------------------------------------------------------------
@@ -1546,13 +1583,21 @@ class HyperliquidMCPServer:
                 ]
             except Exception as e:
                 logger.error(f"Tool {name} failed: {e}", exc_info=True)
+                payload = {"error": str(e), "tool": name, "arguments": arguments}
+                # A read timeout on a write means the signed request may have
+                # reached the exchange and executed — "failed" would be a lie.
+                if name in WRITE_TOOLS and isinstance(
+                    e, requests.exceptions.ReadTimeout
+                ):
+                    payload["warning"] = (
+                        "Request timed out AFTER being sent - the action may"
+                        " still have executed. Recheck order status / open"
+                        " orders / positions before retrying."
+                    )
                 return [
                     TextContent(
                         type="text",
-                        text=json.dumps(
-                            {"error": str(e), "tool": name, "arguments": arguments},
-                            separators=(",", ":"),
-                        ),
+                        text=json.dumps(payload, separators=(",", ":")),
                     )
                 ]
 
@@ -1718,10 +1763,12 @@ class HyperliquidMCPServer:
         elif name == "hyperliquid_place_order":
             asset = arguments["asset"]  # Already normalized to integer
             is_buy = arguments["isBuy"]
-            size = float(arguments["size"])
+            size = self._positive_float("size", arguments["size"])
             # Keep price as string if provided, convert to float for SDK
             price_str = arguments.get("price", "0")
             price = float(price_str) if price_str else 0.0
+            if price != 0.0:
+                price = self._positive_float("price", price)
             reduce_only = arguments.get("reduceOnly", False)
             order_type = arguments.get("orderType", {"limit": {"tif": "Gtc"}})
             cloid_str = arguments.get("cloid")
@@ -1734,11 +1781,32 @@ class HyperliquidMCPServer:
             # Create cloid if provided
             cloid = Cloid(cloid_str) if cloid_str else None
 
-            # Handle trigger orders: convert triggerPx string to float
+            # Handle trigger orders
             if "trigger" in order_type:
                 trigger = order_type["trigger"]
-                if "triggerPx" in trigger and isinstance(trigger["triggerPx"], str):
-                    trigger["triggerPx"] = float(trigger["triggerPx"])
+                if "triggerPx" not in trigger:
+                    raise ValueError("Trigger orders require a triggerPx")
+                trigger["triggerPx"] = self._positive_float(
+                    "triggerPx", trigger["triggerPx"]
+                )
+                if price == 0.0:
+                    if trigger.get("isMarket"):
+                        # A trigger-market with limit_px 0 could never execute
+                        # after triggering (a stop that doesn't stop). Bound it
+                        # around the trigger price like the bracket SL: the
+                        # slippage-bounded worst acceptable fill.
+                        price = self.exchange._slippage_price(
+                            coin_name,
+                            is_buy,
+                            Exchange.DEFAULT_SLIPPAGE,
+                            px=trigger["triggerPx"],
+                        )
+                    else:
+                        raise ValueError(
+                            "Non-market trigger orders require an explicit"
+                            " positive price (the limit to rest after"
+                            " triggering)"
+                        )
             elif price == 0.0:
                 # Hyperliquid has no native market orders: a resting buy limit
                 # at 0 would never fill. Emulate market like the SDK's
@@ -1771,10 +1839,19 @@ class HyperliquidMCPServer:
         elif name == "hyperliquid_place_bracket_order":
             asset = arguments["asset"]  # Already normalized to integer
             is_buy = arguments["isBuy"]
-            size = float(arguments["size"])
-            entry_price = float(arguments.get("entryPrice", 0))
-            tp_price = float(arguments["takeProfitPrice"])
-            sl_price = float(arguments["stopLossPrice"])
+            size = self._positive_float("size", arguments["size"])
+            # entryPrice 0/omitted means market entry; anything else must be a
+            # real price. TP/SL must always be: stopLossPrice 0 would both
+            # trigger nonsensically and make _slippage_price silently
+            # substitute the mid for the SL's limit bound (its `if not px`
+            # fallback).
+            entry_price = float(arguments.get("entryPrice", 0) or 0)
+            if entry_price != 0.0:
+                entry_price = self._positive_float("entryPrice", entry_price)
+            tp_price = self._positive_float(
+                "takeProfitPrice", arguments["takeProfitPrice"]
+            )
+            sl_price = self._positive_float("stopLossPrice", arguments["stopLossPrice"])
             reduce_only = arguments.get("reduceOnly", False)
             entry_order_type = arguments.get(
                 "entryOrderType", {"limit": {"tif": "Gtc"}}
@@ -1793,6 +1870,10 @@ class HyperliquidMCPServer:
                     coin_name, is_buy, Exchange.DEFAULT_SLIPPAGE
                 )
                 entry_order_type = {"limit": {"tif": "Ioc"}}
+
+            # Geometry check runs after market-entry resolution so the TP/SL
+            # are validated against the price the entry will actually target.
+            self._validate_bracket_geometry(is_buy, entry_price, tp_price, sl_price)
 
             # The stop-loss triggers as MARKET (isMarket True): a limit SL can
             # gap through its price and never fill, defeating the stop. Its
@@ -2554,6 +2635,32 @@ class HyperliquidMCPServer:
                 f"Invalid {name} parameter: {value!r}. Must be a whole number."
             )
         return int(f)
+
+    @staticmethod
+    def _validate_bracket_geometry(
+        is_buy: bool, entry_price: float, tp_price: float, sl_price: float
+    ) -> None:
+        """Reject a bracket whose TP/SL sit on the wrong side of the entry.
+
+        A wrong-side stop triggers the instant it hits the book — a
+        reduce-only market close at up to 5% slippage — so this must fail
+        before anything is signed. Longs need SL < entry < TP; shorts the
+        mirror.
+        """
+        if is_buy:
+            if not (sl_price < entry_price < tp_price):
+                raise ValueError(
+                    f"Invalid bracket for long: require stopLossPrice < entryPrice"
+                    f" < takeProfitPrice, got SL {sl_price}, entry {entry_price},"
+                    f" TP {tp_price}"
+                )
+        else:
+            if not (tp_price < entry_price < sl_price):
+                raise ValueError(
+                    f"Invalid bracket for short: require takeProfitPrice <"
+                    f" entryPrice < stopLossPrice, got TP {tp_price}, entry"
+                    f" {entry_price}, SL {sl_price}"
+                )
 
     @staticmethod
     def _positive_float(name: str, value: Any) -> float:

@@ -237,3 +237,33 @@ class TestParseBracketResult:
             _bulk_result([{"resting": {"oid": i}} for i in range(4)])
         )
         assert infos[3]["orderType"] == "leg-3"
+
+
+# ---------------------------------------------------------------------------
+# _validate_bracket_geometry
+# ---------------------------------------------------------------------------
+
+
+class TestBracketGeometry:
+    def test_valid_long(self):
+        S._validate_bracket_geometry(True, 100.0, 110.0, 90.0)  # no raise
+
+    def test_valid_short(self):
+        S._validate_bracket_geometry(False, 100.0, 90.0, 110.0)  # no raise
+
+    def test_long_wrong_side_stop_rejected(self):
+        # SL above entry on a long would trigger instantly on placement.
+        with pytest.raises(ValueError, match="long"):
+            S._validate_bracket_geometry(True, 100.0, 110.0, 105.0)
+
+    def test_long_wrong_side_tp_rejected(self):
+        with pytest.raises(ValueError, match="long"):
+            S._validate_bracket_geometry(True, 100.0, 95.0, 90.0)
+
+    def test_short_wrong_side_stop_rejected(self):
+        with pytest.raises(ValueError, match="short"):
+            S._validate_bracket_geometry(False, 100.0, 90.0, 95.0)
+
+    def test_equal_prices_rejected(self):
+        with pytest.raises(ValueError):
+            S._validate_bracket_geometry(True, 100.0, 100.0, 90.0)
