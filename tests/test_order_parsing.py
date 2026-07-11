@@ -267,3 +267,60 @@ class TestBracketGeometry:
     def test_equal_prices_rejected(self):
         with pytest.raises(ValueError):
             S._validate_bracket_geometry(True, 100.0, 100.0, 90.0)
+
+
+# ---------------------------------------------------------------------------
+# _get_trades dead-socket guard
+# ---------------------------------------------------------------------------
+
+import threading
+import time
+from collections import deque
+
+
+def _trades_server(trades, last_recv, rest_returns):
+    """Bare instance wired with just the state _get_trades touches."""
+    inst = object.__new__(S)
+    inst._state_lock = threading.Lock()
+    inst._subscribed_trades = {"BTC"}  # skip live subscription
+    inst.local_trades = {"BTC": deque(trades, maxlen=1000)}
+    inst._trades_last_recv = {"BTC": last_recv}
+    inst._recent_trades_rest = lambda coin, cutoff_ms: rest_returns
+    return inst
+
+
+def _t(offset_secs):
+    return {"time": (time.time() + offset_secs) * 1000, "px": "1", "sz": "1", "side": "B"}
+
+
+class TestGetTradesLiveness:
+    def test_live_socket_serves_mirror(self):
+        inst = _trades_server([_t(-5)], last_recv=time.time() - 1, rest_returns=[])
+        trades, source = inst._get_trades("BTC", window_secs=60)
+        assert source == "websocket" and len(trades) == 1
+
+    def test_live_socket_empty_window_is_no_flow(self):
+        inst = _trades_server([_t(-300)], last_recv=time.time() - 1, rest_returns=[])
+        trades, source = inst._get_trades("BTC", window_secs=60)
+        assert source == "websocket" and trades == []
+
+    def test_dead_socket_with_residual_window_falls_back_to_rest(self):
+        # Socket died mid-window: the deque still holds in-window trades, but
+        # the tape is missing its most recent minutes — must NOT be served as
+        # fresh websocket data.
+        rest_tape = [_t(-1), _t(-2)]
+        inst = _trades_server(
+            [_t(-50)], last_recv=time.time() - 120, rest_returns=rest_tape
+        )
+        trades, source = inst._get_trades("BTC", window_secs=3600)
+        assert source == "rest" and trades == rest_tape
+
+    def test_cold_start_uses_rest(self):
+        inst = object.__new__(S)
+        inst._state_lock = threading.Lock()
+        inst._subscribed_trades = {"BTC"}
+        inst.local_trades = {}
+        inst._trades_last_recv = {}
+        inst._recent_trades_rest = lambda coin, cutoff_ms: ["primed"]
+        trades, source = inst._get_trades("BTC", window_secs=60)
+        assert source == "rest" and trades == ["primed"]

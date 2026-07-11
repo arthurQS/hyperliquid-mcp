@@ -338,11 +338,14 @@ class HyperliquidMCPServer:
 
         Trade-stream staleness is not the same as book staleness: a live market
         can be legitimately silent for a while, so silence alone must not force a
-        REST round-trip. We fall back to REST only on cold start (no WS data yet,
-        handles the subscribe->data race) or when the window is empty AND we
-        cannot confirm the socket is alive (no message within cold_secs) — the
-        mandatory guard against a silently-dead socket, since run_forever() does
-        not auto-reconnect.
+        REST round-trip. But the mirror is only trustworthy while the socket is
+        confirmably alive (a message within cold_secs): with a dead socket, the
+        deque's residual trades would serve a tape silently missing its most
+        recent minutes — worse than an empty one, since CVD/TFI/vwap would be
+        computed on it. So ANY read past cold_secs of silence falls back to REST
+        (run_forever() does not auto-reconnect), as does cold start (no WS data
+        yet — the subscribe->data race). Within cold_secs, an empty window is
+        trusted as a real "no flow".
         """
         self._ensure_trades_subscription(coin)
         cutoff_ms = time.time() * 1000 - window_secs * 1000
@@ -355,15 +358,11 @@ class HyperliquidMCPServer:
         if last_recv is None:
             return self._recent_trades_rest(coin, cutoff_ms), "rest"
 
-        windowed = [t for t in snapshot if t.get("time", 0) >= cutoff_ms]
-        if windowed:
-            return windowed, "websocket"
+        if (time.time() - last_recv) >= cold_secs:
+            return self._recent_trades_rest(coin, cutoff_ms), "rest"
 
-        # Empty window: trust the silence if we heard from the socket recently
-        # (a real "no flow"); otherwise fall back to REST as the dead-socket guard.
-        if (time.time() - last_recv) < cold_secs:
-            return [], "websocket"
-        return self._recent_trades_rest(coin, cutoff_ms), "rest"
+        windowed = [t for t in snapshot if t.get("time", 0) >= cutoff_ms]
+        return windowed, "websocket"
 
     def _on_asset_ctx(self, coin: str, msg: dict) -> None:
         """WS callback: mirror the latest activeAssetCtx (incl. openInterest).
