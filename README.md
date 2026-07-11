@@ -1,6 +1,6 @@
 # hyperliquid-mcp
 
-An MCP server that gives your AI direct, signed access to Hyperliquid perps. Built on the official Python SDK, hardened for the one failure mode that actually costs money: a rejected order reported as success. Every write parses the exchange response before it claims anything. Every read tells you where the data came from.
+An MCP server that gives your AI/LLM direct, signed access to Hyperliquid perps. Built on the official Python SDK, hardened for the one failure mode that actually costs money: a rejected order reported as success. Every write parses the exchange response before it claims anything. Every read tells you where the data came from.
 
 You point Claude (or any MCP client) at it, hand it a key, and it trades.
 
@@ -180,4 +180,4 @@ MIT.
 
 ## Disclaimer
 
-This is software that lets a language model sign orders against a perpetuals exchange with real leverage. It is provided as-is, it has edge cases, and markets do not care about you. Trade only what you can lose entirely. Nobody here is responsible for your P&L.
+This software that lets a language model sign orders against a perpetuals exchange with real leverage. It is provided as-is, it has edge cases, and markets do not care about you. Trade only what you can lose entirely. Nobody here is responsible for your P&L.
