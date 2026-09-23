@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Format check
+        run: uv run black --check src tests
+      - name: Tests
+        run: uv run pytest -q
+      - name: Type check
+        run: uv run mypy src/
+      - name: Build package
+        run: uv build

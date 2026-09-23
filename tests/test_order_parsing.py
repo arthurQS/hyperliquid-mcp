@@ -416,6 +416,8 @@ class TestIdempotency:
 import threading
 import time
 from collections import deque
+import sqlite3
+import os
 
 
 def _trades_server(trades, last_recv, rest_returns):
@@ -513,3 +515,306 @@ class TestInitFailureCleanup:
         with pytest.raises(ConnectionError):
             inst._init_hyperliquid()
         assert created["info"].disconnected is True
+
+
+# ---------------------------------------------------------------------------
+# Hardening: policy, ledger, approval, readback-free helpers
+# ---------------------------------------------------------------------------
+
+
+class TestPolicyAndApprovalHardening:
+    def test_slippage_policy_returns_decimal_and_rejects_excess(self):
+        inst = _inst()
+        inst.policy = {"max_slippage_bps": 25}
+
+        assert inst._enforce_slippage_policy(10) == 0.001
+        with pytest.raises(PermissionError, match="policy max"):
+            inst._enforce_slippage_policy(26)
+
+    def test_asset_policy_accepts_allowlist_and_rejects_other_assets(self):
+        inst = _inst()
+        inst.policy = {"allowed_assets": {"BTC", "ETH"}}
+
+        inst._enforce_asset_policy("BTC")
+        inst._enforce_asset_policy("builder:ETH")
+        with pytest.raises(PermissionError, match="not in"):
+            inst._enforce_asset_policy("SOL")
+
+    def test_require_bracket_for_open_blocks_naked_place_order(self, tmp_path):
+        inst = _inst()
+        inst.testnet = True
+        inst.trading_enabled = False
+        inst.allow_main_wallet = False
+        inst.require_approval = False
+        inst.policy = {"require_bracket_for_open": True, "max_slippage_bps": 25}
+        inst.state_dir = tmp_path
+        inst.account_address = "0x" + "22" * 20
+        inst.vault_address = None
+        inst.asset_index_to_name = {0: "BTC"}
+        inst._init_ledger()
+
+        with pytest.raises(PermissionError, match="Naked opening"):
+            inst._handle_tool_call(
+                "hyperliquid_place_order",
+                {
+                    "asset": 0,
+                    "isBuy": True,
+                    "size": "1",
+                    "idempotencyKey": "manual-20260923-bracket",
+                },
+            )
+
+    def test_payload_hash_ignores_approval_token(self):
+        a = S._payload_hash(
+            "hyperliquid_place_order",
+            {"idempotencyKey": "abc12345", "approvalToken": "x"},
+        )
+        b = S._payload_hash(
+            "hyperliquid_place_order",
+            {"idempotencyKey": "abc12345", "approvalToken": "y"},
+        )
+        assert a == b
+
+    def test_approval_token_is_deterministic(self):
+        inst = _inst()
+        inst.approval_secret = "secret"
+        inst.private_key = ""
+        token = inst._approval_token("manual-12345678", "a" * 64)
+        assert token == inst._approval_token("manual-12345678", "a" * 64)
+        assert len(token) == 16
+
+    def test_approval_token_requires_explicit_secret(self):
+        inst = _inst()
+        inst.approval_secret = ""
+        inst.private_key = "0x" + "11" * 32
+
+        with pytest.raises(ValueError, match="approval_secret"):
+            inst._approval_token("manual-12345678", "a" * 64)
+
+    def test_restricted_config_file_mode_required(self, tmp_path):
+        cfg = tmp_path / "config.toml"
+        cfg.write_text("testnet = true\n")
+        os.chmod(cfg, 0o644)
+
+        with pytest.raises(PermissionError, match="0600"):
+            S._load_config(str(cfg))
+
+        os.chmod(cfg, 0o600)
+        assert S._load_config(str(cfg))["testnet"] is True
+
+
+class TestLedgerHardening:
+    def test_operation_ledger_records_and_reads_state(self, tmp_path):
+        inst = _inst()
+        inst.state_dir = tmp_path
+        inst.testnet = True
+        inst.account_address = "0x" + "22" * 20
+        inst._init_ledger()
+
+        payload_hash, inserted, prior_status = inst._record_operation(
+            "hyperliquid_place_order",
+            {"idempotencyKey": "manual-20260923-ledger", "asset": 0},
+            "prepared",
+        )
+        assert inserted is True
+        assert prior_status == "prepared"
+        inst._update_operation(
+            "manual-20260923-ledger",
+            "accepted",
+            {"status": "ok"},
+            {"openOrders": []},
+        )
+
+        out = inst._get_operation("manual-20260923-ledger")
+        assert out["status"] == "ok"
+        assert out["operation"]["payload_hash"] == payload_hash
+        assert out["operation"]["status"] == "accepted"
+        assert out["operation"]["response"] == {"status": "ok"}
+        assert out["operation"]["readback"] == {"openOrders": []}
+
+    def test_operation_ledger_redacts_approval_token(self, tmp_path):
+        inst = _inst()
+        inst.state_dir = tmp_path
+        inst.testnet = True
+        inst.account_address = None
+        inst._init_ledger()
+        inst._record_operation(
+            "hyperliquid_place_order",
+            {
+                "idempotencyKey": "manual-20260923-redact",
+                "asset": 0,
+                "approvalToken": "do-not-store",
+            },
+            "prepared",
+        )
+
+        out = inst._get_operation("manual-20260923-redact")
+        assert "approvalToken" not in out["operation"]["request"]
+
+    def test_operation_ledger_rejects_same_key_different_payload(self, tmp_path):
+        inst = _inst()
+        inst.state_dir = tmp_path
+        inst.testnet = True
+        inst.account_address = None
+        inst._init_ledger()
+        inst._record_operation(
+            "hyperliquid_place_order",
+            {"idempotencyKey": "manual-20260923-ledger", "asset": 0},
+            "prepared",
+        )
+
+        with pytest.raises(ValueError, match="different payload"):
+            inst._record_operation(
+                "hyperliquid_place_order",
+                {"idempotencyKey": "manual-20260923-ledger", "asset": 1},
+                "prepared",
+            )
+
+    def test_operation_ledger_does_not_reset_existing_terminal_status(self, tmp_path):
+        inst = _inst()
+        inst.state_dir = tmp_path
+        inst.testnet = True
+        inst.account_address = None
+        inst._init_ledger()
+        args = {"idempotencyKey": "manual-20260923-terminal", "asset": 0}
+        inst._record_operation("hyperliquid_place_order", args, "prepared")
+        inst._update_operation("manual-20260923-terminal", "accepted", {"ok": True})
+
+        _, inserted, prior_status = inst._record_operation(
+            "hyperliquid_place_order", args, "prepared"
+        )
+        assert inserted is False
+        assert prior_status == "accepted"
+
+        assert (
+            inst._get_operation("manual-20260923-terminal")["operation"]["status"]
+            == "accepted"
+        )
+
+    def test_exception_rejection_does_not_corrupt_existing_indeterminate(
+        self, tmp_path
+    ):
+        inst = _inst()
+        inst.state_dir = tmp_path
+        inst.testnet = True
+        inst.account_address = None
+        inst._init_ledger()
+        key = "manual-20260923-indeterminate"
+        inst._record_operation(
+            "hyperliquid_place_order", {"idempotencyKey": key, "asset": 0}, "prepared"
+        )
+        inst._update_operation(key, "indeterminate", {"mayHaveExecuted": True})
+
+        inst._mark_write_exception_rejected(
+            key,
+            {"error": "idempotencyKey already exists with a different payload"},
+        )
+
+        out = inst._get_operation(key)["operation"]
+        assert out["status"] == "indeterminate"
+        assert out["response"] == {"mayHaveExecuted": True}
+
+    def test_different_payload_retry_does_not_corrupt_existing_prepared(self, tmp_path):
+        inst = _inst()
+        inst.state_dir = tmp_path
+        inst.testnet = True
+        inst.account_address = None
+        inst._init_ledger()
+        key = "manual-20260923-prepared-mismatch"
+        inst._record_operation(
+            "hyperliquid_place_order", {"idempotencyKey": key, "asset": 0}, "prepared"
+        )
+
+        inst._mark_write_exception_rejected(
+            key,
+            {"error": "idempotencyKey already exists with a different payload"},
+        )
+
+        out = inst._get_operation(key)["operation"]
+        assert out["status"] == "prepared"
+        assert out["request"] == {"idempotencyKey": key, "asset": 0}
+        assert "response" not in out
+
+    def test_exception_rejection_marks_prepared_local_failure(self, tmp_path):
+        inst = _inst()
+        inst.state_dir = tmp_path
+        inst.testnet = True
+        inst.account_address = None
+        inst._init_ledger()
+        key = "manual-20260923-prepared"
+        inst._record_operation(
+            "hyperliquid_place_order", {"idempotencyKey": key, "asset": 0}, "prepared"
+        )
+
+        inst._mark_write_exception_rejected(
+            key, {"error": "policy blocked", "approvalToken": "x"}
+        )
+
+        out = inst._get_operation(key)["operation"]
+        assert out["status"] == "rejected"
+        assert out["response"] == {"error": "policy blocked"}
+
+    def test_exception_rejection_marks_submitting_failure_indeterminate(self, tmp_path):
+        inst = _inst()
+        inst.state_dir = tmp_path
+        inst.testnet = True
+        inst.account_address = "account"
+        inst.vault_address = None
+        inst._init_ledger()
+        key = "manual-20260923-submitting"
+        inst._record_operation(
+            "hyperliquid_place_order", {"idempotencyKey": key, "asset": 0}, "prepared"
+        )
+        inst._update_operation(key, "submitting", {"tool": "hyperliquid_place_order"})
+
+        class FakeInfo:
+            def user_state(self, address):
+                return {"address": address}
+
+            def frontend_open_orders(self, address):
+                return []
+
+        inst.info = FakeInfo()
+        inst._mark_write_exception_rejected(key, {"error": "parse failed"})
+
+        out = inst._get_operation(key)["operation"]
+        assert out["status"] == "indeterminate"
+        assert out["response"] == {"error": "parse failed"}
+        assert out["readback"]["positions"] == {"address": "account"}
+
+    def test_ledger_uses_wal(self, tmp_path):
+        inst = _inst()
+        inst.state_dir = tmp_path
+        inst._init_ledger()
+        with sqlite3.connect(inst.ledger_path) as db:
+            assert db.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert oct(tmp_path.stat().st_mode & 0o777) == "0o700"
+        assert oct(inst.ledger_path.stat().st_mode & 0o777) == "0o600"
+
+    def test_readback_uses_vault_address_when_present(self):
+        inst = _inst()
+        inst.account_address = "account"
+        inst.vault_address = "vault"
+        seen = []
+
+        class FakeInfo:
+            def user_state(self, address):
+                seen.append(("user_state", address))
+                return {}
+
+            def frontend_open_orders(self, address):
+                seen.append(("frontend_open_orders", address))
+                return []
+
+            def query_order_by_oid(self, address, oid):
+                seen.append(("query_order_by_oid", address, oid))
+                return {}
+
+        inst.info = FakeInfo()
+        inst._readback_state("BTC", 1)
+
+        assert seen == [
+            ("user_state", "vault"),
+            ("frontend_open_orders", "vault"),
+            ("query_order_by_oid", "vault", 1),
+        ]

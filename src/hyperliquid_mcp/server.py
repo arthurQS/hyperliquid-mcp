@@ -2,16 +2,25 @@
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import re
+import sqlite3
 import sys
 import threading
 import time
 from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Optional
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    tomllib = None
 
 import eth_account
 import numpy as np
@@ -63,6 +72,7 @@ WRITE_TOOLS = frozenset(
 )
 
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,100}$")
+DEFAULT_STATE_DIR = Path.home() / ".hyperliquid-mcp"
 
 
 class HyperliquidMCPServer:
@@ -72,16 +82,49 @@ class HyperliquidMCPServer:
         """Initialize the Hyperliquid MCP server."""
         self.server = Server("hyperliquid-mcp")
 
-        # Load configuration from environment
-        self.private_key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
-        self.account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
-        self.vault_address = os.getenv("HYPERLIQUID_VAULT_ADDRESS")
-        self.testnet = os.getenv("HYPERLIQUID_TESTNET", "").lower() == "true"
-        self.trading_enabled = (
-            os.getenv("HYPERLIQUID_TRADING_ENABLED", "").lower() == "true"
+        # Load configuration from an optional profile-local TOML file, then env.
+        self.config_path = os.getenv("HYPERLIQUID_CONFIG")
+        self.config = self._load_config(self.config_path)
+        self.private_key = self._config_value("private_key", "HYPERLIQUID_PRIVATE_KEY")
+        private_key_file = self._config_value(
+            "private_key_file", "HYPERLIQUID_PRIVATE_KEY_FILE"
         )
-        self.allow_main_wallet = (
-            os.getenv("HYPERLIQUID_ALLOW_MAIN_WALLET", "").lower() == "true"
+        if private_key_file:
+            self.private_key = self._read_secret_file(private_key_file)
+        self.account_address = self._config_value(
+            "account_address", "HYPERLIQUID_ACCOUNT_ADDRESS"
+        )
+        self.vault_address = self._config_value(
+            "vault_address", "HYPERLIQUID_VAULT_ADDRESS"
+        )
+        self.testnet = self._config_bool("testnet", "HYPERLIQUID_TESTNET", False)
+        self.trading_enabled = self._config_bool(
+            "trading_enabled", "HYPERLIQUID_TRADING_ENABLED", False
+        )
+        self.allow_main_wallet = self._config_bool(
+            "allow_main_wallet", "HYPERLIQUID_ALLOW_MAIN_WALLET", False
+        )
+        self.require_approval = self._config_bool(
+            "require_approval", "HYPERLIQUID_REQUIRE_APPROVAL", False
+        )
+        self.approval_secret = self._config_value(
+            "approval_secret", "HYPERLIQUID_APPROVAL_SECRET", ""
+        )
+        if self.require_approval and not self.approval_secret:
+            raise ValueError(
+                "HYPERLIQUID_REQUIRE_APPROVAL=true requires explicit HYPERLIQUID_APPROVAL_SECRET"
+            )
+        self.state_dir = Path(
+            self._config_value(
+                "state_dir", "HYPERLIQUID_STATE_DIR", str(DEFAULT_STATE_DIR)
+            )
+        ).expanduser()
+        self.policy = self._load_policy()
+        self.health_host = str(
+            self._config_value("health_host", "HYPERLIQUID_HEALTH_HOST", "127.0.0.1")
+        )
+        self.health_port = int(
+            self._config_value("health_port", "HYPERLIQUID_HEALTH_PORT", 0) or 0
         )
         # Which builder (HIP-3) perp dexes to preload alongside the primary dex.
         # Loading a dex's universe costs one REST round-trip each, and the
@@ -122,11 +165,144 @@ class HyperliquidMCPServer:
             set()
         )  # coins with a live activeAssetCtx subscription
 
+        self._init_ledger()
+
         # Initialize Hyperliquid SDK
         self._init_hyperliquid()
 
         # Register handlers
         self._register_handlers()
+        self._start_health_server()
+
+    @staticmethod
+    def _load_config(path: Optional[str]) -> dict:
+        if not path:
+            return {}
+        if tomllib is None:
+            raise RuntimeError("HYPERLIQUID_CONFIG requires Python 3.11+ tomllib")
+        p = Path(path).expanduser()
+        mode = p.stat().st_mode & 0o777
+        if mode & 0o077:
+            raise PermissionError(f"Config file {p} must be mode 0600/owner-only")
+        with open(p, "rb") as f:
+            return tomllib.load(f)
+
+    def _config_value(self, key: str, env: str, default: Any = None) -> Any:
+        if env in os.environ:
+            return os.environ[env]
+        return self.config.get(key, default)
+
+    def _config_bool(self, key: str, env: str, default: bool = False) -> bool:
+        raw = self._config_value(key, env, default)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _read_secret_file(path: str) -> str:
+        p = Path(path).expanduser()
+        mode = p.stat().st_mode & 0o777
+        if mode & 0o077:
+            raise PermissionError(f"Secret file {p} must be mode 0600/owner-only")
+        return p.read_text().strip()
+
+    def _load_policy(self) -> dict:
+        cfg = self.config.get("policy", {}) if isinstance(self.config, dict) else {}
+
+        def val(name: str, env: str, default: Any = None) -> Any:
+            return os.getenv(env, cfg.get(name, default))
+
+        allowed_assets_raw = val("allowed_assets", "HYPERLIQUID_ALLOWED_ASSETS", "")
+        allowed_assets = {
+            a.strip().upper() for a in str(allowed_assets_raw).split(",") if a.strip()
+        }
+        return {
+            "allowed_assets": allowed_assets,
+            "max_order_notional_usd": float(
+                val("max_order_notional_usd", "HYPERLIQUID_MAX_ORDER_NOTIONAL_USD", 0)
+                or 0
+            ),
+            "max_leverage": int(
+                val("max_leverage", "HYPERLIQUID_MAX_LEVERAGE", 0) or 0
+            ),
+            "max_slippage_bps": float(
+                val("max_slippage_bps", "HYPERLIQUID_MAX_SLIPPAGE_BPS", 50) or 50
+            ),
+            "disable_cancel_all": str(
+                val("disable_cancel_all", "HYPERLIQUID_DISABLE_CANCEL_ALL", "true")
+            ).lower()
+            in {"1", "true", "yes", "on"},
+            "require_bracket_for_open": str(
+                val(
+                    "require_bracket_for_open",
+                    "HYPERLIQUID_REQUIRE_BRACKET_FOR_OPEN",
+                    "false",
+                )
+            ).lower()
+            in {"1", "true", "yes", "on"},
+        }
+
+    def _init_ledger(self) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.state_dir, 0o700)
+        self.ledger_path = self.state_dir / "operations.sqlite"
+        with sqlite3.connect(self.ledger_path) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS operations (
+                    idempotency_key TEXT PRIMARY KEY,
+                    tool TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    network TEXT NOT NULL,
+                    account_address TEXT,
+                    created_ms INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL,
+                    request_json TEXT NOT NULL,
+                    response_json TEXT,
+                    readback_json TEXT
+                )
+                """)
+        os.chmod(self.ledger_path, 0o600)
+
+    def _start_health_server(self) -> None:
+        """Optional daemon-style health endpoints for external supervisors."""
+        if not self.health_port:
+            self.health_server = None
+            return
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib callback name
+                if self.path not in {"/healthz", "/readyz"}:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                ready = outer.info is not None and outer.exchange is not None
+                self.send_response(200 if self.path == "/healthz" or ready else 503)
+                self.send_header("content-type", "application/json")
+                self.end_headers()
+                payload = {
+                    "status": "ok" if ready else "starting",
+                    "network": "testnet" if outer.testnet else "mainnet",
+                    "trading_enabled": outer.trading_enabled,
+                    "ledger": str(outer.ledger_path),
+                }
+                self.wfile.write(json.dumps(payload, separators=(",", ":")).encode())
+
+            def log_message(self, format, *args):
+                return
+
+        self.health_server = ThreadingHTTPServer(
+            (self.health_host, self.health_port), Handler
+        )
+        thread = threading.Thread(target=self.health_server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(
+            "Health endpoints serving on http://%s:%s",
+            self.health_host,
+            self.health_port,
+        )
 
     def _init_hyperliquid(self):
         """Initialize Hyperliquid Exchange and Info instances."""
@@ -1009,7 +1185,7 @@ class HyperliquidMCPServer:
                             },
                             "price": {
                                 "type": "string",
-                                "description": "Limit price as a string (e.g., '181.5'). Set to '0' for a market-style order: executed as an aggressive IoC limit at mid +/- 5% slippage protection.",
+                                "description": "Limit price as a string (e.g., '181.5'). Set to '0' for a market-style order: executed as an aggressive IoC limit at mid +/- configured maxSlippageBps protection.",
                             },
                             "reduceOnly": {
                                 "type": "boolean",
@@ -1029,13 +1205,17 @@ class HyperliquidMCPServer:
                                 "type": "string",
                                 "description": "Required client operation id for signed writes (8-100 ASCII chars). Used to derive/recheck cloid on retry.",
                             },
+                            "maxSlippageBps": {
+                                "type": "number",
+                                "description": "Required/checked for market-style price=0 orders. Must be <= policy max_slippage_bps.",
+                            },
                         },
                         "required": ["asset", "isBuy", "size", "idempotencyKey"],
                     },
                 ),
                 Tool(
                     name="hyperliquid_place_bracket_order",
-                    description="Place a complete bracket order (entry + take profit + stop loss) in a single atomic batch. Minimum order value is $10. The TP and SL are reduce-only trigger orders; the TP rests as a limit at its price, the SL triggers as a market order (with 5% slippage bound) so it cannot gap through unfilled.",
+                    description="Place a complete bracket order (entry + take profit + stop loss) in a single atomic batch. Minimum order value is $10. The TP and SL are reduce-only trigger orders; the TP rests as a limit at its price, the SL triggers as a market order (with configured maxSlippageBps bound) so it cannot gap through unfilled.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -1054,7 +1234,7 @@ class HyperliquidMCPServer:
                             },
                             "entryPrice": {
                                 "type": "string",
-                                "description": "Entry limit price as a string (e.g., '181.5'). Set to '0' for market-style entry: executed as an aggressive IoC limit at mid +/- 5% slippage protection.",
+                                "description": "Entry limit price as a string (e.g., '181.5'). Set to '0' for market-style entry: executed as an aggressive IoC limit at mid +/- configured maxSlippageBps protection.",
                             },
                             "takeProfitPrice": {
                                 "type": "string",
@@ -1077,6 +1257,10 @@ class HyperliquidMCPServer:
                             "idempotencyKey": {
                                 "type": "string",
                                 "description": "Required client operation id for signed writes. The server derives deterministic cloids for entry/tp/sl from it.",
+                            },
+                            "maxSlippageBps": {
+                                "type": "number",
+                                "description": "Slippage bound for market-style entry and stop-market limit bound. Must be <= policy max_slippage_bps.",
                             },
                         },
                         "required": [
@@ -1248,6 +1432,20 @@ class HyperliquidMCPServer:
                     },
                 ),
                 # Order Queries
+                Tool(
+                    name="hyperliquid_get_operation",
+                    description="Read durable operation ledger state by idempotencyKey, including status, payload hash, exchange response, and readback.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "idempotencyKey": {
+                                "type": "string",
+                                "description": "Operation idempotency key",
+                            }
+                        },
+                        "required": ["idempotencyKey"],
+                    },
+                ),
                 Tool(
                     name="hyperliquid_get_open_orders",
                     description="Get user's currently open orders",
@@ -1664,7 +1862,11 @@ class HyperliquidMCPServer:
                 ]
             except Exception as e:
                 logger.error(f"Tool {name} failed: {e}", exc_info=True)
-                payload = {"error": str(e), "tool": name, "arguments": arguments}
+                payload = {
+                    "error": str(e),
+                    "tool": name,
+                    "arguments": self._redact_arguments(arguments),
+                }
                 # A read timeout on a write means the signed request may have
                 # reached the exchange and executed — "failed" would be a lie.
                 if name in WRITE_TOOLS and isinstance(
@@ -1675,6 +1877,21 @@ class HyperliquidMCPServer:
                         " still have executed. Recheck order status / open"
                         " orders / positions before retrying."
                     )
+                    key = arguments.get("idempotencyKey")
+                    if key:
+                        try:
+                            self._update_operation(
+                                key, "indeterminate", payload, self._readback_state()
+                            )
+                        except Exception as ledger_error:
+                            payload["ledger_error"] = str(ledger_error)
+                elif name in WRITE_TOOLS:
+                    key = arguments.get("idempotencyKey")
+                    if key:
+                        try:
+                            self._mark_write_exception_rejected(key, payload)
+                        except Exception as ledger_error:
+                            payload["ledger_error"] = str(ledger_error)
                 return [
                     TextContent(
                         type="text",
@@ -1718,6 +1935,42 @@ class HyperliquidMCPServer:
         if name in WRITE_TOOLS:
             self._guard_write_access(name)
             idempotency_key = self._require_idempotency_key(name, arguments)
+            payload_hash, inserted, prior_status = self._record_operation(
+                name, arguments, "prepared"
+            )
+            operation = self._get_operation(idempotency_key).get("operation", {})
+            if not inserted and not (
+                self.require_approval
+                and prior_status == "prepared"
+                and arguments.get("approvalToken")
+                == self._approval_token(idempotency_key, payload_hash)
+            ):
+                return {
+                    "status": "duplicate_idempotency_key",
+                    "message": "Existing durable operation returned; not resubmitting",
+                    "operation": operation,
+                }
+            if self.require_approval:
+                expected = self._approval_token(idempotency_key, payload_hash)
+                if arguments.get("approvalToken") != expected:
+                    return {
+                        "status": "awaiting_approval",
+                        "message": "Mainnet write prepared but not dispatched; resubmit with approvalToken to execute",
+                        "idempotencyKey": idempotency_key,
+                        "payloadHash": payload_hash,
+                        "approvalToken": expected if self.testnet else None,
+                    }
+            arguments = self._redact_arguments(arguments)
+            if not self._try_transition_operation(
+                idempotency_key, {"prepared"}, "submitting", {"tool": name}
+            ):
+                return {
+                    "status": "duplicate_idempotency_key",
+                    "message": "Existing durable operation returned; not resubmitting",
+                    "operation": self._get_operation(idempotency_key).get(
+                        "operation", {}
+                    ),
+                }
         else:
             idempotency_key = None
 
@@ -1817,6 +2070,7 @@ class HyperliquidMCPServer:
             }
 
         elif name == "hyperliquid_update_leverage":
+            assert idempotency_key is not None
             asset = arguments["asset"]  # Already normalized to integer
             leverage = arguments["leverage"]  # Already normalized to integer
             is_cross = arguments.get("isCross", True)
@@ -1825,19 +2079,31 @@ class HyperliquidMCPServer:
             coin_name = self.asset_index_to_name.get(asset)
             if coin_name is None:
                 raise ValueError(f"Unknown asset index: {asset}")
+            self._enforce_asset_policy(coin_name)
+            max_lev = int(self.policy.get("max_leverage") or 0)
+            if leverage < 1:
+                raise ValueError("leverage must be >= 1")
+            if max_lev and leverage > max_lev:
+                raise PermissionError(
+                    f"leverage {leverage} exceeds policy max {max_lev}"
+                )
 
             result = self.exchange.update_leverage(leverage, coin_name, is_cross)
 
             # Surface a request-level rejection (e.g. leverage above maxLeverage)
             # cleanly instead of returning an opaque {"status": "err"} blob.
             err = self._top_level_error(result)
+            readback = self._readback_state(coin_name)
             if err is not None:
-                return {"error": err, "requestParams": arguments}
+                self._update_operation(idempotency_key, "rejected", result, readback)
+                return {"error": err, "readback": readback, "requestParams": arguments}
 
+            self._update_operation(idempotency_key, "accepted", result, readback)
             mode = "cross" if is_cross else "isolated"
             return {
                 "message": f"Leverage set to {leverage}x ({mode}) for {coin_name}",
                 "data": result,
+                "readback": readback,
                 "summary": {
                     "asset": asset,
                     "coin": coin_name,
@@ -1858,6 +2124,10 @@ class HyperliquidMCPServer:
             if price != 0.0:
                 price = self._positive_float("price", price)
             reduce_only = arguments.get("reduceOnly", False)
+            if self.policy.get("require_bracket_for_open") and not reduce_only:
+                raise PermissionError(
+                    "Naked opening place_order blocked by policy: use hyperliquid_place_bracket_order or reduceOnly=true"
+                )
             order_type = arguments.get("orderType", {"limit": {"tif": "Gtc"}})
             cloid_str = arguments.get("cloid")
 
@@ -1865,6 +2135,12 @@ class HyperliquidMCPServer:
             coin_name = self.asset_index_to_name.get(asset)
             if coin_name is None:
                 raise ValueError(f"Unknown asset index: {asset}")
+            self._enforce_asset_policy(coin_name)
+            slippage = self._enforce_slippage_policy(
+                float(
+                    arguments.get("maxSlippageBps") or self.policy["max_slippage_bps"]
+                )
+            )
 
             # Create cloid from explicit raw cloid or deterministic idempotency key.
             cloid = (
@@ -1890,7 +2166,7 @@ class HyperliquidMCPServer:
                         price = self.exchange._slippage_price(
                             coin_name,
                             is_buy,
-                            Exchange.DEFAULT_SLIPPAGE,
+                            slippage,
                             px=trigger["triggerPx"],
                         )
                     else:
@@ -1903,10 +2179,9 @@ class HyperliquidMCPServer:
                 # Hyperliquid has no native market orders: a resting buy limit
                 # at 0 would never fill. Emulate market like the SDK's
                 # market_open: aggressive IoC limit at mid +/- 5% slippage.
-                price = self.exchange._slippage_price(
-                    coin_name, is_buy, Exchange.DEFAULT_SLIPPAGE
-                )
+                price = self.exchange._slippage_price(coin_name, is_buy, slippage)
                 order_type = {"limit": {"tif": "Ioc"}}
+            self._validate_order_preflight(coin_name, size, price)
 
             result = self.exchange.order(
                 name=coin_name,
@@ -1921,21 +2196,30 @@ class HyperliquidMCPServer:
             # The top-level message must agree with the parsed status — a
             # rejected order under an "Order placed" headline reads as success.
             order_info = self._parse_order_response(result)
+            readback = self._readback_state(coin_name, order_info.get("orderId"))
             if order_info["status"] not in {"resting", "filled"}:
+                self._update_operation(
+                    idempotency_key, "indeterminate", result, readback
+                )
                 return {
                     "message": f"Order placement not confirmed for {coin_name}",
                     "error": order_info.get("error", "unconfirmed order status"),
                     "data": result,
                     "orderInfo": order_info,
+                    "readback": readback,
                     "idempotencyKey": idempotency_key,
                     "cloid": cloid.to_raw(),
                     "requestParams": arguments,
                 }
 
+            self._update_operation(
+                idempotency_key, order_info["status"], result, readback
+            )
             return {
                 "message": f"Order placed for {coin_name}",
                 "data": result,
                 "orderInfo": order_info,
+                "readback": readback,
                 "idempotencyKey": idempotency_key,
                 "cloid": cloid.to_raw(),
                 "requestParams": arguments,
@@ -1967,14 +2251,18 @@ class HyperliquidMCPServer:
             coin_name = self.asset_index_to_name.get(asset)
             if coin_name is None:
                 raise ValueError(f"Unknown asset index: {asset}")
+            self._enforce_asset_policy(coin_name)
+            slippage = self._enforce_slippage_policy(
+                float(
+                    arguments.get("maxSlippageBps") or self.policy["max_slippage_bps"]
+                )
+            )
 
             # Market entry (entryPrice 0/omitted): emulate with an aggressive
-            # IoC limit at mid +/- 5% slippage — a real limit at 0 would rest
+            # IoC limit at mid +/- configured slippage — a real limit at 0 would rest
             # forever on the buy side.
             if entry_price == 0.0:
-                entry_price = self.exchange._slippage_price(
-                    coin_name, is_buy, Exchange.DEFAULT_SLIPPAGE
-                )
+                entry_price = self.exchange._slippage_price(coin_name, is_buy, slippage)
                 entry_order_type = {"limit": {"tif": "Ioc"}}
 
             # Geometry check runs after market-entry resolution so the TP/SL
@@ -1985,8 +2273,9 @@ class HyperliquidMCPServer:
             # gap through its price and never fill, defeating the stop. Its
             # limit_px is the slippage-bounded worst fill around the trigger.
             sl_limit_px = self.exchange._slippage_price(
-                coin_name, not is_buy, Exchange.DEFAULT_SLIPPAGE, px=sl_price
+                coin_name, not is_buy, slippage, px=sl_price
             )
+            self._validate_order_preflight(coin_name, size, entry_price)
 
             # Deterministic client IDs make timeout/retry investigation possible.
             entry_cloid = self._cloid_from_idempotency(idempotency_key, "entry")
@@ -2052,10 +2341,14 @@ class HyperliquidMCPServer:
             # chain: on failure `response` is a string, not a statuses dict.
             err = self._top_level_error(result)
             if err is not None:
+                readback = self._readback_state(coin_name)
+                self._update_operation(idempotency_key, "rejected", result, readback)
                 return {
                     "message": "Bracket order placement failed",
                     "error": err,
                     "data": result,
+                    "readback": readback,
+                    "idempotencyKey": idempotency_key,
                     "requestParams": arguments,
                 }
 
@@ -2069,6 +2362,10 @@ class HyperliquidMCPServer:
                 result
             )
             if failed_legs:
+                readback = self._readback_state(coin_name)
+                self._update_operation(
+                    idempotency_key, "indeterminate", result, readback
+                )
                 if group_rejected:
                     message = (
                         "Bracket order rejected by exchange (atomic group"
@@ -2083,13 +2380,23 @@ class HyperliquidMCPServer:
                     ),
                     "data": result,
                     "orders": order_infos,
+                    "readback": readback,
+                    "idempotencyKey": idempotency_key,
+                    "cloids": {
+                        "entry": entry_cloid.to_raw(),
+                        "tp": tp_cloid.to_raw(),
+                        "sl": sl_cloid.to_raw(),
+                    },
                     "requestParams": arguments,
                 }
 
+            readback = self._readback_state(coin_name)
+            self._update_operation(idempotency_key, "accepted", result, readback)
             return {
                 "message": "Bracket order placed successfully",
                 "data": result,
                 "orders": order_infos,
+                "readback": readback,
                 "idempotencyKey": idempotency_key,
                 "cloids": {
                     "entry": entry_cloid.to_raw(),
@@ -2100,27 +2407,39 @@ class HyperliquidMCPServer:
             }
 
         elif name == "hyperliquid_cancel_order":
+            assert idempotency_key is not None
             coin = arguments["coin"]
             oid = arguments["oid"]  # Already normalized to integer
+            self._enforce_asset_policy(coin)
 
             result = self.exchange.cancel(coin, oid)
 
             summary = self._parse_cancel_result(result, [{"coin": coin, "oid": oid}])
+            readback = self._readback_state(coin, oid)
             if summary["failedCount"]:
+                self._update_operation(
+                    idempotency_key, "indeterminate", result, readback
+                )
                 return {
                     "message": f"Cancel failed for order {oid} ({coin})",
                     "error": summary.get("error", "unrecognized cancel status"),
                     "data": result,
+                    "readback": readback,
                     "requestParams": arguments,
                 }
 
+            self._update_operation(idempotency_key, "accepted", result, readback)
             return {
                 "message": f"Order {oid} cancelled for {coin}",
                 "data": result,
+                "readback": readback,
                 "cancelledOrder": {"coin": coin, "orderId": oid},
             }
 
         elif name == "hyperliquid_cancel_all_orders":
+            assert idempotency_key is not None
+            if self.policy.get("disable_cancel_all"):
+                raise PermissionError("cancel_all_orders disabled by policy")
             dex = arguments.get("dex", "")
 
             # frontend_open_orders (not open_orders) so untriggered TP/SL
@@ -2129,6 +2448,12 @@ class HyperliquidMCPServer:
             open_orders = self.info.frontend_open_orders(user_address, dex=dex)
 
             if not open_orders:
+                self._update_operation(
+                    idempotency_key,
+                    "accepted",
+                    {"status": "ok", "response": {"data": {"statuses": []}}},
+                    {},
+                )
                 return {
                     "message": "No open orders to cancel",
                     "data": {"status": "ok", "response": {"data": {"statuses": []}}},
@@ -2146,6 +2471,13 @@ class HyperliquidMCPServer:
             # the cancel — report per-oid outcomes so the caller re-checks
             # instead of assuming everything it saw is now gone.
             summary = self._parse_cancel_result(result, cancel_requests)
+            readback = self._readback_state()
+            self._update_operation(
+                idempotency_key,
+                "accepted" if summary["failedCount"] == 0 else "indeterminate",
+                result,
+                readback,
+            )
             response = {
                 "message": (
                     f"Cancelled {summary['cancelledCount']} of "
@@ -2155,12 +2487,14 @@ class HyperliquidMCPServer:
                 "cancelledCount": summary["cancelledCount"],
                 "failedCount": summary["failedCount"],
                 "outcomes": summary["outcomes"],
+                "readback": readback,
             }
             if "error" in summary:
                 response["error"] = summary["error"]
             return response
 
         elif name == "hyperliquid_modify_order":
+            assert idempotency_key is not None
             oid = arguments["oid"]  # Already normalized to integer
             coin = arguments["coin"]
             is_buy = arguments["isBuy"]
@@ -2168,6 +2502,8 @@ class HyperliquidMCPServer:
             price = self._positive_float("price", arguments["price"])
             reduce_only = arguments.get("reduceOnly", False)
             order_type = arguments.get("orderType", {"limit": {"tif": "Gtc"}})
+            self._enforce_asset_policy(coin)
+            self._validate_order_preflight(coin, size, price)
 
             # Same coercion as place_order: a string triggerPx would die deep
             # in the SDK's float_to_wire with an opaque TypeError.
@@ -2190,18 +2526,27 @@ class HyperliquidMCPServer:
             # "moving a stop" and would otherwise believe the position is
             # protected at the new price.
             order_info = self._parse_order_response(result)
+            readback = self._readback_state(coin, oid)
             if order_info["status"] not in {"resting", "filled"}:
+                self._update_operation(
+                    idempotency_key, "indeterminate", result, readback
+                )
                 return {
                     "message": f"Order {oid} modification not confirmed",
                     "error": order_info.get("error", "unconfirmed modify status"),
                     "data": result,
+                    "readback": readback,
                     "requestParams": arguments,
                 }
 
+            self._update_operation(
+                idempotency_key, order_info["status"], result, readback
+            )
             return {
                 "message": f"Order {oid} modified successfully",
                 "data": result,
                 "orderInfo": order_info,
+                "readback": readback,
                 "modifiedOrder": {
                     "orderId": oid,
                     "coin": coin,
@@ -2221,14 +2566,21 @@ class HyperliquidMCPServer:
             )
 
         # Order Queries
+        elif name == "hyperliquid_get_operation":
+            key = arguments["idempotencyKey"]
+            return self._get_operation(key)
+
         elif name == "hyperliquid_get_open_orders":
             dex = arguments.get("dex", "")
-            result = self.info.open_orders(user_address, dex=dex)
+            result = self.info.frontend_open_orders(user_address, dex=dex)
 
             return {
-                "message": "Open orders retrieved successfully",
+                "message": "Frontend open orders (regular + trigger/TP/SL) retrieved successfully",
                 "data": result,
-                "summary": {"numberOfOrders": len(result) if result else 0},
+                "summary": {
+                    "numberOfOrders": len(result) if result else 0,
+                    "includesTriggers": True,
+                },
             }
 
         elif name == "hyperliquid_get_order_status":
@@ -2817,6 +3169,227 @@ class HyperliquidMCPServer:
                 "idempotencyKey must be 8-100 characters using letters, digits, '.', '_', ':', or '-'"
             )
         return key
+
+    @staticmethod
+    def _payload_hash(tool_name: str, arguments: dict) -> str:
+        clean = HyperliquidMCPServer._redact_arguments(arguments)
+        raw = json.dumps({"tool": tool_name, "arguments": clean}, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _redact_arguments(arguments: dict) -> dict:
+        return {k: v for k, v in arguments.items() if k != "approvalToken"}
+
+    def _approval_token(self, idempotency_key: str, payload_hash: str) -> str:
+        if not self.approval_secret:
+            raise ValueError("approval_secret is required to compute approval tokens")
+        secret = self.approval_secret
+        return hmac.new(
+            secret.encode("utf-8"),
+            f"{idempotency_key}:{payload_hash}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()[:16]
+
+    def _record_operation(
+        self, tool_name: str, arguments: dict, status: str
+    ) -> tuple[str, bool, Optional[str]]:
+        idempotency_key = arguments["idempotencyKey"]
+        payload_hash = self._payload_hash(tool_name, arguments)
+        now = int(time.time() * 1000)
+        network = "testnet" if self.testnet else "mainnet"
+        request_json = json.dumps(
+            self._redact_arguments(arguments), sort_keys=True, default=str
+        )
+        with sqlite3.connect(self.ledger_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur = db.execute(
+                """
+                INSERT OR IGNORE INTO operations
+                (idempotency_key,tool,payload_hash,status,network,account_address,created_ms,updated_ms,request_json)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    idempotency_key,
+                    tool_name,
+                    payload_hash,
+                    status,
+                    network,
+                    self.account_address,
+                    now,
+                    now,
+                    request_json,
+                ),
+            )
+            inserted = cur.rowcount == 1
+            row = db.execute(
+                "SELECT payload_hash,status FROM operations WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("operation ledger insert/read failed")
+            if row[0] != payload_hash:
+                raise ValueError(
+                    "idempotencyKey already exists with a different payload; use a new key"
+                )
+            return payload_hash, inserted, row[1]
+
+    def _get_operation(self, idempotency_key: str) -> dict:
+        with sqlite3.connect(self.ledger_path) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute(
+                "SELECT * FROM operations WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return {"status": "not_found", "idempotencyKey": idempotency_key}
+        out = dict(row)
+        for field in ("request_json", "response_json", "readback_json"):
+            if out.get(field):
+                try:
+                    out[field[:-5]] = json.loads(out[field])
+                except Exception:
+                    out[field[:-5]] = out[field]
+                del out[field]
+        return {"status": "ok", "operation": out}
+
+    def _update_operation(
+        self, idempotency_key: str, status: str, response: Any, readback: Any = None
+    ) -> None:
+        with sqlite3.connect(self.ledger_path) as db:
+            db.execute(
+                """
+                UPDATE operations
+                SET status=?,updated_ms=?,response_json=?,readback_json=?
+                WHERE idempotency_key=?
+                """,
+                (
+                    status,
+                    int(time.time() * 1000),
+                    json.dumps(response, sort_keys=True, default=str),
+                    (
+                        json.dumps(readback, sort_keys=True, default=str)
+                        if readback
+                        else None
+                    ),
+                    idempotency_key,
+                ),
+            )
+
+    def _try_transition_operation(
+        self,
+        idempotency_key: str,
+        from_statuses: set[str],
+        to_status: str,
+        response: Any,
+        readback: Any = None,
+    ) -> bool:
+        with sqlite3.connect(self.ledger_path) as db:
+            cur = db.execute(
+                """
+                UPDATE operations
+                SET status=?,updated_ms=?,response_json=?,readback_json=?
+                WHERE idempotency_key=? AND status IN (%s)
+                """ % ",".join("?" for _ in from_statuses),
+                (
+                    to_status,
+                    int(time.time() * 1000),
+                    json.dumps(response, sort_keys=True, default=str),
+                    (
+                        json.dumps(readback, sort_keys=True, default=str)
+                        if readback
+                        else None
+                    ),
+                    idempotency_key,
+                    *from_statuses,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def _mark_write_exception_rejected(
+        self, idempotency_key: str, payload: dict
+    ) -> None:
+        if "different payload" in str(payload.get("error", "")):
+            return
+        existing = self._get_operation(idempotency_key)
+        op = existing.get("operation") or {}
+        # Do not let a bad retry (same key, different payload) corrupt a prior
+        # durable operation row. Only pre-dispatch failures can be rejected.
+        # Once a request is submitting, a generic exception may mean the signed
+        # request reached the exchange and then parsing/ledger/readback failed.
+        if op.get("status") == "prepared":
+            self._update_operation(
+                idempotency_key,
+                "rejected",
+                self._redact_arguments(payload),
+                None,
+            )
+        elif op.get("status") == "submitting":
+            self._update_operation(
+                idempotency_key,
+                "indeterminate",
+                self._redact_arguments(payload),
+                self._readback_state(),
+            )
+
+    def _readback_state(
+        self, coin: Optional[str] = None, oid: Optional[int] = None
+    ) -> dict:
+        """Best-effort post-write readback used before reporting final state."""
+        out: dict[str, Any] = {}
+        read_address = self.vault_address or self.account_address
+        try:
+            out["positions"] = self.info.user_state(read_address)
+        except Exception as e:
+            out["positions_error"] = str(e)
+        try:
+            out["openOrders"] = self.info.frontend_open_orders(read_address)
+        except Exception as e:
+            out["openOrders_error"] = str(e)
+        if oid is not None:
+            try:
+                out["orderStatus"] = self.info.query_order_by_oid(read_address, oid)
+            except Exception as e:
+                out["orderStatus_error"] = str(e)
+        if coin:
+            out["coin"] = coin
+        return out
+
+    def _enforce_asset_policy(self, coin: str) -> None:
+        allowed = self.policy.get("allowed_assets") or set()
+        base_coin = coin.split(":")[-1].upper()
+        if allowed and base_coin not in allowed and coin.upper() not in allowed:
+            raise PermissionError(f"Asset {coin} is not in HYPERLIQUID_ALLOWED_ASSETS")
+
+    def _enforce_slippage_policy(self, bps: float) -> float:
+        max_bps = float(self.policy.get("max_slippage_bps") or 0)
+        if max_bps and bps > max_bps:
+            raise PermissionError(f"maxSlippageBps {bps} exceeds policy max {max_bps}")
+        if bps <= 0:
+            raise ValueError("maxSlippageBps must be positive")
+        return bps / 10000.0
+
+    def _validate_order_preflight(self, coin: str, size: float, price: float) -> None:
+        try:
+            meta = self.info.meta()
+            asset_idx = self.info.name_to_asset.get(coin)
+            if asset_idx is not None and asset_idx < len(meta.get("universe", [])):
+                info = meta["universe"][asset_idx]
+                sz_decimals = int(info.get("szDecimals", 8))
+                size_text = f"{size:.16f}".rstrip("0").rstrip(".")
+                decimals = len(size_text.split(".")[1]) if "." in size_text else 0
+                if decimals > sz_decimals:
+                    raise ValueError(
+                        f"size exceeds szDecimals={sz_decimals} for {coin}"
+                    )
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.warning(f"Preflight precision validation skipped for {coin}: {e}")
+        if price > 0 and size * price < 10:
+            raise ValueError("Order notional must be at least $10")
+        max_notional = float(self.policy.get("max_order_notional_usd") or 0)
+        if max_notional and price > 0 and size * price > max_notional:
+            raise PermissionError(f"Order notional exceeds policy max ${max_notional}")
 
     @staticmethod
     def _cloid_from_idempotency(idempotency_key: str, suffix: str) -> Cloid:

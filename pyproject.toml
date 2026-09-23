@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "hyperliquid-python-sdk>=0.6.0",
+    "hyperliquid-python-sdk>=0.24.0,<0.25",
     "mcp>=1.0.0",
     "numpy>=1.24",
 ]
@@ -53,3 +53,7 @@ Documentation = "https://github.com/Dakkshin/hyperliquid-mcp#readme"
 
 [project.scripts]
 hyperliquid-mcp = "hyperliquid_mcp.server:main"
+
+[tool.mypy]
+ignore_missing_imports = true
+disable_error_code = ["call-arg", "assignment"]

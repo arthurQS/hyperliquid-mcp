@@ -70,7 +70,31 @@ The API wallet signs; your main key never touches the machine running the model.
 
 Mainnet writes are blocked unless `HYPERLIQUID_TRADING_ENABLED="true"` is set. Mainnet also requires agent mode by default: the signing wallet from `HYPERLIQUID_PRIVATE_KEY` must be different from `HYPERLIQUID_ACCOUNT_ADDRESS`. To deliberately use the main wallet key anyway, set `HYPERLIQUID_ALLOW_MAIN_WALLET="true"` as a break-glass flag.
 
-Every signed write now requires an `idempotencyKey` (8-100 ASCII chars: letters, digits, `.`, `_`, `:`, `-`). Reuse the same key only when retrying the exact same intent after an indeterminate result. `place_order` derives a deterministic Hyperliquid `cloid` from that key when you do not pass a raw `cloid`; `place_bracket_order` derives separate `entry`/`tp`/`sl` cloids.
+Every signed write now requires an `idempotencyKey` (8-100 ASCII chars: letters, digits, `.`, `_`, `:`, `-`). Reuse the same key only to inspect the durable result for the exact same intent; the server will not resubmit an existing operation automatically. If a write is indeterminate, read it with `hyperliquid_get_operation` plus order/fill/position readback, then create a new key only after you prove the original did not execute or intentionally want a second action. `place_order` derives a deterministic Hyperliquid `cloid` from that key when you do not pass a raw `cloid`; `place_bracket_order` derives separate `entry`/`tp`/`sl` cloids. Writes are recorded in a SQLite WAL ledger under `HYPERLIQUID_STATE_DIR` (default `~/.hyperliquid-mcp/operations.sqlite`); read one with `hyperliquid_get_operation` before retrying.
+
+Production config can come from `HYPERLIQUID_CONFIG=/path/config.local.toml` instead of raw env. Supported top-level keys mirror the env names: `private_key_file`, `account_address`, `vault_address`, `testnet`, `trading_enabled`, `allow_main_wallet`, `state_dir`, `health_host`, `health_port`, `require_approval`, `approval_secret`. Config and secret files must be owner-only (`0600`). The state directory is forced to `0700` and the SQLite ledger to `0600`. Policy gates live under `[policy]` or env:
+
+```toml
+private_key_file = "/secure/hyperliquid_api_wallet.key"
+account_address = "0xMainAccount..."
+testnet = false
+trading_enabled = true
+state_dir = "/var/lib/hyperliquid-mcp"
+health_host = "127.0.0.1"
+health_port = 8787
+require_approval = true
+approval_secret = "put-this-in-a-0600-config-or-env"
+
+[policy]
+allowed_assets = "BTC,ETH,SOL,HYPE"
+max_order_notional_usd = 2500
+max_leverage = 5
+max_slippage_bps = 50
+disable_cancel_all = true
+require_bracket_for_open = false
+```
+
+`require_approval=true` requires an explicit `approval_secret` and changes writes into a prepared operation unless the caller resubmits the exact same payload with the matching `approvalToken`. The token is never stored in the ledger or echoed inside `requestParams`; on mainnet it is not returned at all, so compute it externally from `approval_secret` and the returned payload hash. Testnet echoes it for smoke tests only. Optional daemon endpoints `/healthz` and `/readyz` are served when `health_port` is non-zero.
 
 **Trading builder-dex perps (equities, gold, HIP-3 stuff).** Set `HYPERLIQUID_PERP_DEXS="xyz"` (comma-separated for several). Unset means primary dex only — ~2s startup, covers every standard perp. `"all"` loads every discovered dex: hundreds of serial REST calls, ~90s, and your MCP client kills the connection at 30s unless you raise `MCP_TIMEOUT=180000`. You almost certainly don't want `"all"`.
 
@@ -80,7 +104,7 @@ Optional: `HYPERLIQUID_VAULT_ADDRESS` if you trade a vault.
 
 Thirty tools. The interesting ones:
 
-**Execution.** `place_order`, `place_bracket_order`, `modify_order`, `cancel_order`, `cancel_all_orders`, `update_leverage`. Market orders are emulated the way the SDK does it — aggressive IoC limit at mid ±5% — because Hyperliquid has no native market order and a resting buy at $0 would just sit there forever.
+**Execution.** `place_order`, `place_bracket_order`, `modify_order`, `cancel_order`, `cancel_all_orders`, `update_leverage`. Market orders are emulated the way the SDK does it — aggressive IoC limit at mid ± configured `max_slippage_bps` — because Hyperliquid has no native market order and a resting buy at $0 would just sit there forever.
 
 **Brackets are real OCO.** Entry + TP + SL ship as one atomic `normalTpsl` group. TP and SL are children of the entry: one fills, the exchange kills the other; cancel the entry, both die. No stale stop left resting on the book at 3am. The stop-loss triggers as *market* with a slippage-bounded limit — a limit stop can gap straight through its price and never fill, which defeats the entire point of a stop.
 
