@@ -74,11 +74,19 @@ class TestParseOrderResponse:
         assert out["status"] == "error"
         assert out["error"] == "Insufficient margin"
 
-    def test_empty_statuses_is_unknown(self):
+    def test_empty_statuses_fail_closed_as_indeterminate(self):
         out = _inst()._parse_order_response(
             {"status": "ok", "response": {"data": {"statuses": [{}]}}}
         )
-        assert out["status"] == "unknown"
+        assert out["status"] == "indeterminate"
+        assert out["mayHaveExecuted"] is True
+
+    def test_missing_statuses_fail_closed_as_indeterminate(self):
+        out = _inst()._parse_order_response(
+            {"status": "ok", "response": {"data": {"statuses": []}}}
+        )
+        assert out["status"] == "indeterminate"
+        assert out["mayHaveExecuted"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +267,29 @@ class TestParseBracketResult:
         )
         assert infos[3]["orderType"] == "leg-3"
 
+    def test_unknown_leg_is_failed_indeterminate(self):
+        infos, failed, group_rejected = _inst()._parse_bracket_result(
+            _bulk_result([{"resting": {"oid": 1}}, {}, "waitingForFill"])
+        )
+        assert group_rejected is False
+        assert len(failed) == 1
+        assert failed[0]["status"] == "indeterminate"
+        assert infos[1]["orderType"] == "take-profit"
+
+    def test_unrecognized_string_leg_is_failed_indeterminate(self):
+        infos, failed, group_rejected = _inst()._parse_bracket_result(
+            _bulk_result([{"resting": {"oid": 1}}, "unexpected", "waitingForFill"])
+        )
+        assert group_rejected is False
+        assert len(failed) == 1
+        assert failed[0]["status"] == "indeterminate"
+        assert infos[1]["orderType"] == "take-profit"
+
+    def test_missing_leg_is_failed_indeterminate(self):
+        info = _inst()._parse_order_status(None)
+        assert info["status"] == "indeterminate"
+        assert info["mayHaveExecuted"] is True
+
 
 # ---------------------------------------------------------------------------
 # _validate_bracket_geometry
@@ -337,6 +368,45 @@ class TestMainnetWriteSafetyGate:
         inst.account_address = "0x" + "22" * 20
 
         inst._guard_write_access("hyperliquid_place_order")
+
+
+# ---------------------------------------------------------------------------
+# Idempotency / client order IDs
+# ---------------------------------------------------------------------------
+
+
+class TestIdempotency:
+    def test_requires_idempotency_key_for_writes(self):
+        with pytest.raises(ValueError, match="idempotencyKey"):
+            S._require_idempotency_key("hyperliquid_place_order", {})
+
+    def test_accepts_reasonable_idempotency_key(self):
+        assert (
+            S._require_idempotency_key(
+                "hyperliquid_place_order", {"idempotencyKey": "manual-20260923-0001"}
+            )
+            == "manual-20260923-0001"
+        )
+
+    def test_rejects_bad_idempotency_key_shape(self):
+        with pytest.raises(ValueError, match="8-100"):
+            S._require_idempotency_key(
+                "hyperliquid_place_order", {"idempotencyKey": "x"}
+            )
+        with pytest.raises(ValueError, match="ASCII"):
+            S._require_idempotency_key(
+                "hyperliquid_place_order", {"idempotencyKey": "manual ç"}
+            )
+
+    def test_cloid_derivation_is_deterministic_and_leg_specific(self):
+        entry = S._cloid_from_idempotency("manual-20260923-0001", "entry")
+        same = S._cloid_from_idempotency("manual-20260923-0001", "entry")
+        stop = S._cloid_from_idempotency("manual-20260923-0001", "sl")
+
+        assert entry.to_raw() == same.to_raw()
+        assert entry.to_raw() != stop.to_raw()
+        assert entry.to_raw().startswith("0x")
+        assert len(entry.to_raw()) == 34
 
 
 # ---------------------------------------------------------------------------

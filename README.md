@@ -70,6 +70,8 @@ The API wallet signs; your main key never touches the machine running the model.
 
 Mainnet writes are blocked unless `HYPERLIQUID_TRADING_ENABLED="true"` is set. Mainnet also requires agent mode by default: the signing wallet from `HYPERLIQUID_PRIVATE_KEY` must be different from `HYPERLIQUID_ACCOUNT_ADDRESS`. To deliberately use the main wallet key anyway, set `HYPERLIQUID_ALLOW_MAIN_WALLET="true"` as a break-glass flag.
 
+Every signed write now requires an `idempotencyKey` (8-100 ASCII chars: letters, digits, `.`, `_`, `:`, `-`). Reuse the same key only when retrying the exact same intent after an indeterminate result. `place_order` derives a deterministic Hyperliquid `cloid` from that key when you do not pass a raw `cloid`; `place_bracket_order` derives separate `entry`/`tp`/`sl` cloids.
+
 **Trading builder-dex perps (equities, gold, HIP-3 stuff).** Set `HYPERLIQUID_PERP_DEXS="xyz"` (comma-separated for several). Unset means primary dex only — ~2s startup, covers every standard perp. `"all"` loads every discovered dex: hundreds of serial REST calls, ~90s, and your MCP client kills the connection at 30s unless you raise `MCP_TIMEOUT=180000`. You almost certainly don't want `"all"`.
 
 Optional: `HYPERLIQUID_VAULT_ADDRESS` if you trade a vault.
@@ -121,7 +123,7 @@ One `get_microstructure` call:
 OBI 0.62 = bids carrying 62% of top-of-book volume. Micro-price above mid = pressure pointing up. Spread ~2bps = liquid.
 
 ```
-Long 4.12 SOL, entry 218, target 219.50, stop 216.80
+Long 4.12 SOL, entry 218, target 219.50, stop 216.80, idempotencyKey manual-20260923-sol-001
 ```
 
 Model resolves SOL's index via `get_meta`, fires `place_bracket_order`, gets back three legs with statuses. If it had asked for a stop above entry, the order never leaves the machine.

@@ -1,10 +1,12 @@
 """Hyperliquid MCP Server - Main implementation."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -55,8 +57,12 @@ WRITE_TOOLS = frozenset(
         "hyperliquid_cancel_order",
         "hyperliquid_cancel_all_orders",
         "hyperliquid_update_leverage",
+        "hyperliquid_place_twap_order",
+        "hyperliquid_cancel_twap_order",
     }
 )
+
+IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,100}$")
 
 
 class HyperliquidMCPServer:
@@ -973,8 +979,12 @@ class HyperliquidMCPServer:
                                 "description": "Margin mode: true = cross margin (default), false = isolated margin.",
                                 "default": True,
                             },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "description": "Required client operation id for signed writes (8-100 ASCII chars: letters, digits, '.', '_', ':', '-'). Reuse the same key only when retrying the same intent.",
+                            },
                         },
-                        "required": ["asset", "leverage"],
+                        "required": ["asset", "leverage", "idempotencyKey"],
                     },
                 ),
                 # Order Management
@@ -1013,10 +1023,14 @@ class HyperliquidMCPServer:
                             },
                             "cloid": {
                                 "type": "string",
-                                "description": "Client order ID (optional, for tracking)",
+                                "description": "Optional raw Hyperliquid cloid (0x + 32 hex chars). If omitted, the server derives one from idempotencyKey.",
+                            },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "description": "Required client operation id for signed writes (8-100 ASCII chars). Used to derive/recheck cloid on retry.",
                             },
                         },
-                        "required": ["asset", "isBuy", "size"],
+                        "required": ["asset", "isBuy", "size", "idempotencyKey"],
                     },
                 ),
                 Tool(
@@ -1060,6 +1074,10 @@ class HyperliquidMCPServer:
                                 "description": "Entry order type configuration",
                                 "default": {"limit": {"tif": "Gtc"}},
                             },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "description": "Required client operation id for signed writes. The server derives deterministic cloids for entry/tp/sl from it.",
+                            },
                         },
                         "required": [
                             "asset",
@@ -1067,6 +1085,7 @@ class HyperliquidMCPServer:
                             "size",
                             "takeProfitPrice",
                             "stopLossPrice",
+                            "idempotencyKey",
                         ],
                     },
                 ),
@@ -1084,8 +1103,12 @@ class HyperliquidMCPServer:
                                 "type": "integer",
                                 "description": "Order ID (oid) - the unique order identifier returned when order was placed",
                             },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "description": "Required client operation id for signed writes; reuse only when retrying the same cancel intent.",
+                            },
                         },
-                        "required": ["coin", "oid"],
+                        "required": ["coin", "oid", "idempotencyKey"],
                     },
                 ),
                 Tool(
@@ -1103,7 +1126,12 @@ class HyperliquidMCPServer:
                                 "description": "Perp dex name (optional)",
                                 "default": "",
                             },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "description": "Required client operation id for signed writes; reuse only when retrying the same cancel-all intent.",
+                            },
                         },
+                        "required": ["idempotencyKey"],
                     },
                 ),
                 Tool(
@@ -1139,8 +1167,19 @@ class HyperliquidMCPServer:
                                 "description": "Order type configuration",
                                 "default": {"limit": {"tif": "Gtc"}},
                             },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "description": "Required client operation id for signed writes; reuse only when retrying the same modify intent.",
+                            },
                         },
-                        "required": ["oid", "coin", "isBuy", "size", "price"],
+                        "required": [
+                            "oid",
+                            "coin",
+                            "isBuy",
+                            "size",
+                            "price",
+                            "idempotencyKey",
+                        ],
                     },
                 ),
                 Tool(
@@ -1176,8 +1215,18 @@ class HyperliquidMCPServer:
                                 "description": "Whether to randomize TWAP intervals",
                                 "default": True,
                             },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "description": "Required client operation id for signed writes.",
+                            },
                         },
-                        "required": ["coin", "isBuy", "size", "minutes"],
+                        "required": [
+                            "coin",
+                            "isBuy",
+                            "size",
+                            "minutes",
+                            "idempotencyKey",
+                        ],
                     },
                 ),
                 Tool(
@@ -1189,9 +1238,13 @@ class HyperliquidMCPServer:
                             "twapId": {
                                 "type": "integer",
                                 "description": "TWAP order ID to cancel",
-                            }
+                            },
+                            "idempotencyKey": {
+                                "type": "string",
+                                "description": "Required client operation id for signed writes.",
+                            },
                         },
-                        "required": ["twapId"],
+                        "required": ["twapId", "idempotencyKey"],
                     },
                 ),
                 # Order Queries
@@ -1664,6 +1717,9 @@ class HyperliquidMCPServer:
 
         if name in WRITE_TOOLS:
             self._guard_write_access(name)
+            idempotency_key = self._require_idempotency_key(name, arguments)
+        else:
+            idempotency_key = None
 
         # Account & Position Management
         if name == "hyperliquid_get_account_info":
@@ -1792,6 +1848,7 @@ class HyperliquidMCPServer:
 
         # Order Management
         elif name == "hyperliquid_place_order":
+            assert idempotency_key is not None
             asset = arguments["asset"]  # Already normalized to integer
             is_buy = arguments["isBuy"]
             size = self._positive_float("size", arguments["size"])
@@ -1809,8 +1866,12 @@ class HyperliquidMCPServer:
             if coin_name is None:
                 raise ValueError(f"Unknown asset index: {asset}")
 
-            # Create cloid if provided
-            cloid = Cloid(cloid_str) if cloid_str else None
+            # Create cloid from explicit raw cloid or deterministic idempotency key.
+            cloid = (
+                Cloid(cloid_str)
+                if cloid_str
+                else self._cloid_from_idempotency(idempotency_key, "order")
+            )
 
             # Handle trigger orders
             if "trigger" in order_type:
@@ -1860,12 +1921,14 @@ class HyperliquidMCPServer:
             # The top-level message must agree with the parsed status — a
             # rejected order under an "Order placed" headline reads as success.
             order_info = self._parse_order_response(result)
-            if order_info["status"] == "error":
+            if order_info["status"] not in {"resting", "filled"}:
                 return {
-                    "message": f"Order placement failed for {coin_name}",
-                    "error": order_info["error"],
+                    "message": f"Order placement not confirmed for {coin_name}",
+                    "error": order_info.get("error", "unconfirmed order status"),
                     "data": result,
                     "orderInfo": order_info,
+                    "idempotencyKey": idempotency_key,
+                    "cloid": cloid.to_raw(),
                     "requestParams": arguments,
                 }
 
@@ -1873,10 +1936,13 @@ class HyperliquidMCPServer:
                 "message": f"Order placed for {coin_name}",
                 "data": result,
                 "orderInfo": order_info,
+                "idempotencyKey": idempotency_key,
+                "cloid": cloid.to_raw(),
                 "requestParams": arguments,
             }
 
         elif name == "hyperliquid_place_bracket_order":
+            assert idempotency_key is not None
             asset = arguments["asset"]  # Already normalized to integer
             is_buy = arguments["isBuy"]
             size = self._positive_float("size", arguments["size"])
@@ -1922,6 +1988,11 @@ class HyperliquidMCPServer:
                 coin_name, not is_buy, Exchange.DEFAULT_SLIPPAGE, px=sl_price
             )
 
+            # Deterministic client IDs make timeout/retry investigation possible.
+            entry_cloid = self._cloid_from_idempotency(idempotency_key, "entry")
+            tp_cloid = self._cloid_from_idempotency(idempotency_key, "tp")
+            sl_cloid = self._cloid_from_idempotency(idempotency_key, "sl")
+
             # Create order requests for bracket
             # Note: The SDK's exchange.order() expects floats, not strings
             # The SDK will handle the conversion to wire format internally
@@ -1934,6 +2005,7 @@ class HyperliquidMCPServer:
                     "limit_px": entry_price,
                     "order_type": entry_order_type,
                     "reduce_only": reduce_only,
+                    "cloid": entry_cloid,
                 },
                 # Take profit order (opposite side, reduce-only)
                 {
@@ -1949,8 +2021,8 @@ class HyperliquidMCPServer:
                         }
                     },
                     "reduce_only": True,
+                    "cloid": tp_cloid,
                 },
-                # Stop loss order (opposite side, reduce-only, market trigger)
                 {
                     "coin": coin_name,
                     "is_buy": not is_buy,
@@ -1964,6 +2036,7 @@ class HyperliquidMCPServer:
                         }
                     },
                     "reduce_only": True,
+                    "cloid": sl_cloid,
                 },
             ]
 
@@ -2017,6 +2090,12 @@ class HyperliquidMCPServer:
                 "message": "Bracket order placed successfully",
                 "data": result,
                 "orders": order_infos,
+                "idempotencyKey": idempotency_key,
+                "cloids": {
+                    "entry": entry_cloid.to_raw(),
+                    "tp": tp_cloid.to_raw(),
+                    "sl": sl_cloid.to_raw(),
+                },
                 "requestParams": arguments,
             }
 
@@ -2111,10 +2190,10 @@ class HyperliquidMCPServer:
             # "moving a stop" and would otherwise believe the position is
             # protected at the new price.
             order_info = self._parse_order_response(result)
-            if order_info["status"] == "error":
+            if order_info["status"] not in {"resting", "filled"}:
                 return {
-                    "message": f"Order {oid} modification failed",
-                    "error": order_info["error"],
+                    "message": f"Order {oid} modification not confirmed",
+                    "error": order_info.get("error", "unconfirmed modify status"),
                     "data": result,
                     "requestParams": arguments,
                 }
@@ -2722,6 +2801,32 @@ class HyperliquidMCPServer:
             )
 
     @staticmethod
+    def _require_idempotency_key(tool_name: str, arguments: dict) -> str:
+        """Require an operator-supplied idempotency key for every write."""
+        key = arguments.get("idempotencyKey")
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"{tool_name} requires idempotencyKey for signed writes")
+        if not IDEMPOTENCY_KEY_RE.fullmatch(key):
+            try:
+                key.encode("ascii")
+            except UnicodeEncodeError:
+                raise ValueError(
+                    "idempotencyKey must contain only ASCII letters, digits, '.', '_', ':', or '-'"
+                )
+            raise ValueError(
+                "idempotencyKey must be 8-100 characters using letters, digits, '.', '_', ':', or '-'"
+            )
+        return key
+
+    @staticmethod
+    def _cloid_from_idempotency(idempotency_key: str, suffix: str) -> Cloid:
+        """Derive a valid 16-byte Hyperliquid cloid from an idempotency key."""
+        digest = hashlib.blake2s(
+            f"{idempotency_key}:{suffix}".encode("utf-8"), digest_size=16
+        ).hexdigest()
+        return Cloid(f"0x{digest}")
+
+    @staticmethod
     def _validate_bracket_geometry(
         is_buy: bool, entry_price: float, tp_price: float, sl_price: float
     ) -> None:
@@ -2795,10 +2900,12 @@ class HyperliquidMCPServer:
                 "error": err,
                 "message": "Order placement failed",
             }
-        order_status = (
-            result.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-        )
-        return self._parse_order_status(order_status)
+        statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+        order_status = statuses[0] if statuses else None
+        parsed = self._parse_order_status(order_status)
+        if parsed["status"] == "unknown":
+            return self._indeterminate_write_status(order_status)
+        return parsed
 
     def _parse_cancel_result(self, result: Any, requested: list) -> dict:
         """Summarize a cancel/bulk_cancel response against the requested orders.
@@ -2872,10 +2979,22 @@ class HyperliquidMCPServer:
                     leg_names[idx] if idx < len(leg_names) else f"leg-{idx}"
                 )
             order_infos.append(info)
-        failed_legs = [i for i in order_infos if i["status"] == "error"]
+        failed_legs = [
+            i for i in order_infos if i["status"] in {"error", "indeterminate"}
+        ]
         return order_infos, failed_legs, group_rejected
 
-    def _parse_order_status(self, status: dict) -> dict:
+    @staticmethod
+    def _indeterminate_write_status(raw_status: Any) -> dict:
+        return {
+            "status": "indeterminate",
+            "error": "Exchange response did not contain a known success or rejection status",
+            "message": "Write outcome is indeterminate; recheck by cloid/order status/open orders/fills before retrying",
+            "mayHaveExecuted": True,
+            "rawStatus": raw_status,
+        }
+
+    def _parse_order_status(self, status: Any) -> dict:
         """Parse a single order status.
 
         Statuses are usually dicts keyed by outcome, but the exchange also
@@ -2888,7 +3007,7 @@ class HyperliquidMCPServer:
                 "message": "Trigger order accepted; activates when the entry fills",
             }
         if not isinstance(status, dict):
-            return {"status": "unknown", "rawStatus": status}
+            return self._indeterminate_write_status(status)
         if "resting" in status:
             return {
                 "status": "resting",
@@ -2910,7 +3029,7 @@ class HyperliquidMCPServer:
                 "message": "Order placement failed",
             }
         else:
-            return {"status": "unknown", "rawStatus": status}
+            return self._indeterminate_write_status(status)
 
     async def run(self):
         """Run the MCP server."""

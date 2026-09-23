@@ -261,8 +261,10 @@ class TestParseOrderStatus:
         out = self.parse({"error": "Insufficient margin"})
         assert out["status"] == "error" and out["error"] == "Insufficient margin"
 
-    def test_unknown(self):
-        assert self.parse({"weird": 1})["status"] == "unknown"
+    def test_unknown_fails_closed(self):
+        out = self.parse({"weird": 1})
+        assert out["status"] == "indeterminate"
+        assert out["mayHaveExecuted"] is True
 
 
 # ---------------------------------------------------------------------------
