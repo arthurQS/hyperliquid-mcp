@@ -61,11 +61,14 @@ Skip this and every write comes back `User or API Wallet does not exist`. The se
 "env": {
   "HYPERLIQUID_PRIVATE_KEY": "0xApiWalletKey...",
   "HYPERLIQUID_ACCOUNT_ADDRESS": "0xYourMainAccount...",
+  "HYPERLIQUID_TRADING_ENABLED": "true",
   "HYPERLIQUID_TESTNET": "false"
 }
 ```
 
 The API wallet signs; your main key never touches the machine running the model. This is the only sane production configuration. Agent approvals are per-network — a mainnet-approved agent is a stranger on testnet.
+
+Mainnet writes are blocked unless `HYPERLIQUID_TRADING_ENABLED="true"` is set. Mainnet also requires agent mode by default: the signing wallet from `HYPERLIQUID_PRIVATE_KEY` must be different from `HYPERLIQUID_ACCOUNT_ADDRESS`. To deliberately use the main wallet key anyway, set `HYPERLIQUID_ALLOW_MAIN_WALLET="true"` as a break-glass flag.
 
 **Trading builder-dex perps (equities, gold, HIP-3 stuff).** Set `HYPERLIQUID_PERP_DEXS="xyz"` (comma-separated for several). Unset means primary dex only — ~2s startup, covers every standard perp. `"all"` loads every discovered dex: hundreds of serial REST calls, ~90s, and your MCP client kills the connection at 30s unless you raise `MCP_TIMEOUT=180000`. You almost certainly don't want `"all"`.
 

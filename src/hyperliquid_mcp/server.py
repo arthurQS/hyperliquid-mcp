@@ -71,6 +71,12 @@ class HyperliquidMCPServer:
         self.account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
         self.vault_address = os.getenv("HYPERLIQUID_VAULT_ADDRESS")
         self.testnet = os.getenv("HYPERLIQUID_TESTNET", "").lower() == "true"
+        self.trading_enabled = (
+            os.getenv("HYPERLIQUID_TRADING_ENABLED", "").lower() == "true"
+        )
+        self.allow_main_wallet = (
+            os.getenv("HYPERLIQUID_ALLOW_MAIN_WALLET", "").lower() == "true"
+        )
         # Which builder (HIP-3) perp dexes to preload alongside the primary dex.
         # Loading a dex's universe costs one REST round-trip each, and the
         # network now exposes hundreds of them (237 on testnet), so eager-loading
@@ -1656,6 +1662,9 @@ class HyperliquidMCPServer:
         # covers clients that send an explicit null)
         user_address = arguments.get("userAddress") or self.account_address
 
+        if name in WRITE_TOOLS:
+            self._guard_write_access(name)
+
         # Account & Position Management
         if name == "hyperliquid_get_account_info":
             dex = arguments.get("dex", "")
@@ -2679,6 +2688,38 @@ class HyperliquidMCPServer:
                 f"Invalid {name} parameter: {value!r}. Must be a whole number."
             )
         return int(f)
+
+    def _guard_write_access(self, tool_name: str) -> None:
+        """Block real-money writes unless the operator explicitly opts in.
+
+        Testnet remains frictionless so operators can exercise the full path.
+        Mainnet writes require HYPERLIQUID_TRADING_ENABLED=true and, by
+        default, agent mode (API wallet signing for a distinct main account).
+        Using the main wallet key on mainnet is possible only with the explicit
+        HYPERLIQUID_ALLOW_MAIN_WALLET=true break-glass flag.
+        """
+        if self.testnet:
+            return
+        if not self.trading_enabled:
+            raise PermissionError(
+                f"{tool_name} blocked on mainnet: set "
+                "HYPERLIQUID_TRADING_ENABLED=true to allow signed writes."
+            )
+
+        wallet_address = getattr(getattr(self, "wallet", None), "address", None)
+        account_address = self.account_address or wallet_address
+        if (
+            not self.allow_main_wallet
+            and wallet_address
+            and account_address
+            and wallet_address.lower() == account_address.lower()
+        ):
+            raise PermissionError(
+                f"{tool_name} blocked on mainnet: agent mode is required. "
+                "Set HYPERLIQUID_ACCOUNT_ADDRESS to the main account and sign "
+                "with an approved API wallet, or explicitly set "
+                "HYPERLIQUID_ALLOW_MAIN_WALLET=true."
+            )
 
     @staticmethod
     def _validate_bracket_geometry(

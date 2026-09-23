@@ -291,6 +291,55 @@ class TestBracketGeometry:
 
 
 # ---------------------------------------------------------------------------
+# Mainnet write safety gate
+# ---------------------------------------------------------------------------
+
+
+class TestMainnetWriteSafetyGate:
+    def test_testnet_writes_allowed_without_enable_flag(self):
+        inst = _inst()
+        inst.testnet = True
+        inst.trading_enabled = False
+        inst.allow_main_wallet = False
+        inst.account_address = None
+        inst.wallet = type("Wallet", (), {"address": "0x" + "11" * 20})()
+
+        inst._guard_write_access("hyperliquid_place_order")
+
+    def test_mainnet_write_blocked_unless_explicitly_enabled(self):
+        inst = _inst()
+        inst.testnet = False
+        inst.trading_enabled = False
+        inst.allow_main_wallet = False
+        inst.account_address = "0x" + "22" * 20
+        inst.wallet = type("Wallet", (), {"address": "0x" + "11" * 20})()
+
+        with pytest.raises(PermissionError, match="HYPERLIQUID_TRADING_ENABLED=true"):
+            inst._guard_write_access("hyperliquid_place_order")
+
+    def test_mainnet_write_requires_agent_mode_by_default(self):
+        inst = _inst()
+        inst.testnet = False
+        inst.trading_enabled = True
+        inst.allow_main_wallet = False
+        inst.wallet = type("Wallet", (), {"address": "0x" + "11" * 20})()
+        inst.account_address = inst.wallet.address
+
+        with pytest.raises(PermissionError, match="agent mode"):
+            inst._guard_write_access("hyperliquid_place_order")
+
+    def test_mainnet_agent_mode_write_allowed_when_enabled(self):
+        inst = _inst()
+        inst.testnet = False
+        inst.trading_enabled = True
+        inst.allow_main_wallet = False
+        inst.wallet = type("Wallet", (), {"address": "0x" + "11" * 20})()
+        inst.account_address = "0x" + "22" * 20
+
+        inst._guard_write_access("hyperliquid_place_order")
+
+
+# ---------------------------------------------------------------------------
 # _get_trades dead-socket guard
 # ---------------------------------------------------------------------------
 
